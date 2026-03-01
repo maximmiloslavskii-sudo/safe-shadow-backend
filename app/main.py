@@ -1,13 +1,19 @@
 """
-Safe Shadow Backend — реальный алгоритм теневых маршрутов.
-Поддерживает любой город мира.
+Safe Shadow Backend — три маршрута по физике тени.
 
-Алгоритм (2 прохода):
-  1. Получаем начальные маршруты (OSRM прямые + 8 детуров по сторонам света)
-  2. Анализируем тень для каждого
-  3. Если лучший маршрут даёт < 50% тени → ищем «солнечные горячие точки»
-     и делаем целевые боковые детуры вокруг них
-  4. Анализируем новые кандидаты, объединяем, сортируем
+Всегда возвращает ровно 3 маршрута:
+  route-fast     : Самый быстрый  — кратчайший маршрут от OSRM
+  route-balanced : Оптимальный    — лучший баланс время/тень из OSRM-альтернатив
+  route-shade    : Максимум тени  — строится через граф улиц OSM
+                   с весами по физике тени (солнечная геометрия + геометрия застройки)
+
+Физика маршрута route-shade учитывает:
+  - Временные/астрономические параметры: дата, время, широта, долгота → ephem
+  - Высота и азимут солнца, солнечная деклинация, часовой угол
+  - Геометрия застройки: H/W ratio, ориентация улицы, угол закрытия небосвода
+  - Локальные затеняющие объекты: здания, деревья, лесные массивы (Overpass)
+  - Sky View Factor (через shadow_reach / street_width)
+  - Коэффициент рассеяния УФ (облачность, УФ-индекс)
 """
 import asyncio
 import math
@@ -27,14 +33,16 @@ from pydantic import BaseModel, Field
 
 from .shadow import (
     sun_position, interpolate_route, bearing_deg, offset_point,
-    fetch_buildings, fetch_weather, analyse_route
+    fetch_buildings, fetch_weather, analyse_route,
+    build_shadow_polys, fetch_street_network, find_shade_route,
+    haversine_m,
 )
 from .ratelimit import RateLimiter
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "10"))
 
 app = FastAPI(title="Safe Shadow Backend", version=APP_VERSION)
@@ -48,21 +56,17 @@ OSRM_BASE_FOOT = "https://routing.openstreetmap.de/routed-foot"
 OSRM_BASE_BIKE = "https://routing.openstreetmap.de/routed-bike"
 
 # ─── Кэш зданий (TTL 10 минут) ────────────────────────────────────────────────
-# Ключ: rounded bbox string, значение: (buildings, timestamp)
 _buildings_cache: dict = {}
-_BUILDINGS_CACHE_TTL = 600  # 10 минут в секундах
+_BUILDINGS_CACHE_TTL = 600
 
 def _cache_key(coords: list) -> str:
-    """Округлённый bbox маршрута до ~1 км."""
     if not coords:
         return ""
     lats = [c[0] for c in coords]
     lons = [c[1] for c in coords]
-    # Округляем до 0.01° (~1.1 км)
     return f"{min(lats):.2f},{min(lons):.2f},{max(lats):.2f},{max(lons):.2f}"
 
 async def _fetch_buildings_cached(coords: list, client) -> list:
-    """Возвращает здания из кэша или запрашивает Overpass."""
     key = _cache_key(coords)
     now = time.time()
     if key in _buildings_cache:
@@ -75,7 +79,6 @@ async def _fetch_buildings_cached(coords: list, client) -> list:
             fetch_buildings(coords, client), timeout=30.0
         )
         _buildings_cache[key] = (buildings, now)
-        # Чистим старые записи кэша (держим не более 50)
         if len(_buildings_cache) > 50:
             oldest = min(_buildings_cache, key=lambda k: _buildings_cache[k][1])
             del _buildings_cache[oldest]
@@ -97,11 +100,13 @@ class ClientInfo(BaseModel):
     device_id: str = Field(default="unknown", min_length=1)
 
 class RoutesRequest(BaseModel):
-    preset: Literal["fast", "less_uv", "cooler"]
+    # preset сохранён для обратной совместимости, но игнорируется —
+    # сервер всегда возвращает 3 маршрута (fast / balanced / shade).
+    preset: Optional[Literal["fast", "less_uv", "cooler"]] = None
     origin: LatLon
     destination: LatLon
     departure_time: Optional[str] = None
-    walk_speed_mps: float = Field(1.35, ge=0.5, le=20.0)   # велосипед до 20 м/с
+    walk_speed_mps: float = Field(1.35, ge=0.5, le=20.0)
     transport: Literal["foot", "bike"] = "foot"
     client: ClientInfo = ClientInfo()
 
@@ -123,12 +128,13 @@ class SideGuidanceItem(BaseModel):
 
 class RouteOut(BaseModel):
     id: str
+    label: str        # «Быстрый» / «Оптимальный» / «Теневой»
     polyline: str
     distance_m: int
     duration_s: int
     metrics: Metrics
     side_guidance: List[SideGuidanceItem]
-    shade_map: str = ""   # "0110..." 1=shade, 0=sun, шаг=40м
+    shade_map: str = ""  # "0110..." 1=тень 0=солнце, шаг=40м
 
 class RoutesResponse(BaseModel):
     routes: List[RouteOut]
@@ -177,7 +183,7 @@ async def _osrm_routes(
     client: httpx.AsyncClient,
     transport: str = "foot"
 ) -> list[dict]:
-    """Возвращает до 5 маршрутов (пешком или велосипед): прямые + 8 детуров."""
+    """Возвращает до 5 маршрутов: прямые + 8 детуров для выбора balanced-маршрута."""
     o = f"{origin.lon},{origin.lat}"
     d = f"{dest.lon},{dest.lat}"
 
@@ -188,7 +194,7 @@ async def _osrm_routes(
     seen_polylines = {r["polyline"] for r in direct}
     all_routes = list(direct)
 
-    if len(all_routes) < 5:
+    if len(all_routes) < 4:
         mid_lat = (origin.lat + dest.lat) / 2
         mid_lon = (origin.lon + dest.lon) / 2
         dist_m  = direct[0]["distance"]
@@ -220,84 +226,7 @@ async def _osrm_routes(
     all_routes.sort(key=lambda r: r["distance"])
     return all_routes[:5]
 
-# ─── Shade-seeking helpers ────────────────────────────────────────────────────
-
-def _sun_hotspots(
-    interp_points: list[tuple[float, float]],
-    shade_map: str,
-    min_run_pts: int = 3,   # ≥3×40м = ≥120м сплошного солнца
-    max_hotspots: int = 2
-) -> list[dict]:
-    """
-    Находит самые длинные «солнечные» участки маршрута и возвращает их
-    географические центры с азимутом движения.
-    """
-    hotspots = []
-    i = 0
-    while i < len(shade_map):
-        if shade_map[i] == '0':
-            j = i
-            while j < len(shade_map) and shade_map[j] == '0':
-                j += 1
-            run_len = j - i
-            if run_len >= min_run_pts:
-                mid    = i + run_len // 2
-                pt_idx = min(mid, len(interp_points) - 1)
-                lat, lon = interp_points[pt_idx]
-                prev_i = max(0, pt_idx - 1)
-                next_i = min(len(interp_points) - 1, pt_idx + 1)
-                b = bearing_deg(
-                    interp_points[prev_i][0], interp_points[prev_i][1],
-                    interp_points[next_i][0],  interp_points[next_i][1]
-                )
-                hotspots.append({
-                    "lat": lat, "lon": lon,
-                    "bearing": b, "run_len": run_len
-                })
-            i = j
-        else:
-            i += 1
-
-    hotspots.sort(key=lambda h: h["run_len"], reverse=True)
-    return hotspots[:max_hotspots]
-
-
-async def _shade_targeted_routes(
-    o: str,
-    d: str,
-    hotspots: list[dict],
-    client: httpx.AsyncClient,
-    max_dist: float,
-    seen_polylines: set,
-    transport: str = "foot"
-) -> list[dict]:
-    """
-    Для каждой «солнечной горячей точки» пробуем боковые обходы
-    на 80 и 160 м влево и вправо (перпендикулярно маршруту).
-    2 горячих точки × 2 смещения × 2 стороны = 8 OSRM-запросов параллельно.
-    """
-    tasks = []
-    for h in hotspots:
-        lat, lon, bearing = h["lat"], h["lon"], h["bearing"]
-        for offset_m in [80, 160]:
-            for side_deg in [-90, 90]:
-                wlat, wlon = offset_point(lat, lon, offset_m, (bearing + side_deg) % 360)
-                wp = f"{o};{wlon},{wlat};{d}"
-                tasks.append(_osrm_single(wp, client, alternatives=False, transport=transport))
-
-    if not tasks:
-        return []
-
-    new_routes = []
-    for res in await asyncio.gather(*tasks, return_exceptions=True):
-        if isinstance(res, list):
-            for r in res:
-                if r["polyline"] not in seen_polylines and r["distance"] <= max_dist:
-                    seen_polylines.add(r["polyline"])
-                    new_routes.append(r)
-    return new_routes
-
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+# ─── Вспомогательные ──────────────────────────────────────────────────────────
 
 def _parse_depart(departure_time: Optional[str]) -> datetime:
     if departure_time:
@@ -317,8 +246,8 @@ async def _analyse_batch(
     walk_speed: float,
     depart_dt:  datetime,
     loop:       asyncio.AbstractEventLoop
-) -> list[tuple[dict, dict, list]]:
-    """Анализирует список сырых маршрутов, возвращает (raw, stats, interp_points)."""
+) -> list[tuple[dict, dict]]:
+    """Анализирует сырые маршруты, возвращает [(raw, stats), ...]."""
     result = []
     for raw in raw_routes:
         pts   = interpolate_route(raw["coords"])
@@ -334,13 +263,14 @@ async def _analyse_batch(
                 depart_dt  = depart_dt,
             )
         )
-        result.append((raw, stats, pts))
+        result.append((raw, stats))
     return result
 
 
-def _make_route_out(idx: int, raw: dict, stats: dict) -> RouteOut:
+def _make_route_out(route_id: str, label: str, raw: dict, stats: dict) -> RouteOut:
     return RouteOut(
-        id            = f"route-{idx+1}",
+        id            = route_id,
+        label         = label,
         polyline      = raw["polyline"],
         distance_m    = stats["distance_m"],
         duration_s    = stats["duration_s"],
@@ -356,10 +286,27 @@ def _make_route_out(idx: int, raw: dict, stats: dict) -> RouteOut:
         shade_map     = stats.get("shade_map", ""),
     )
 
+# ─── Вычисление bbox для сети улиц ────────────────────────────────────────────
 
-def _shade_fraction(r: RouteOut) -> float:
-    total = r.metrics.shade_minutes + r.metrics.sun_minutes
-    return r.metrics.shade_minutes / total if total > 0 else 0.0
+def _streets_bbox(
+    origin: LatLon, dest: LatLon
+) -> tuple[float, float, float, float]:
+    """
+    Bbox для Overpass-запроса сети улиц.
+    Допускает детуры до 50% длины прямого пути в каждую сторону,
+    минимум 400 м, максимум 1500 м от крайних точек.
+    """
+    direct_m = haversine_m(origin.lat, origin.lon, dest.lat, dest.lon)
+    pad_m    = min(max(direct_m * 0.5, 400), 1500)
+    mid_lat  = (origin.lat + dest.lat) / 2
+    pad_lat  = pad_m / 111_320
+    pad_lon  = pad_m / (111_320 * math.cos(math.radians(mid_lat)))
+
+    s = min(origin.lat, dest.lat) - pad_lat
+    n = max(origin.lat, dest.lat) + pad_lat
+    w = min(origin.lon, dest.lon) - pad_lon
+    e = max(origin.lon, dest.lon) + pad_lon
+    return s, w, n, e
 
 # ─── Endpoint ─────────────────────────────────────────────────────────────────
 
@@ -377,7 +324,7 @@ async def routes(req: RoutesRequest):
     clat = (req.origin.lat + req.destination.lat) / 2
     clon = (req.origin.lon + req.destination.lon) / 2
 
-    # ── 1. Маршруты + погода ──────────────────────────────────────────────────
+    # ── 1. Параллельно: OSRM маршруты + погода ───────────────────────────────
     async with httpx.AsyncClient() as client:
         raw_routes, weather = await asyncio.gather(
             _osrm_routes(req.origin, req.destination, client, transport=req.transport),
@@ -387,109 +334,120 @@ async def routes(req: RoutesRequest):
     sun_alt, sun_az = sun_position(clat, clon, depart_dt)
     log.info(f"Sun: alt={sun_alt:.1f}° az={sun_az:.1f}° | routes={len(raw_routes)}")
 
-    # ── 2. Здания (покрывают все варианты маршрутов, кэш 10 мин) ─────────────
-    all_coords = [c for r in raw_routes for c in r["coords"]]
+    # ── 2. Параллельно: здания + сеть улиц (разные запросы) ──────────────────
+    all_coords  = [c for r in raw_routes for c in r["coords"]]
+    streets_bbox = _streets_bbox(req.origin, req.destination)
+
     async with httpx.AsyncClient() as client:
-        buildings = await _fetch_buildings_cached(all_coords, client)
-    log.info(f"Buildings: {len(buildings)}")
+        buildings, street_segs = await asyncio.gather(
+            _fetch_buildings_cached(all_coords, client),
+            asyncio.wait_for(
+                fetch_street_network(*streets_bbox, client),
+                timeout=25.0
+            )
+        )
+    log.info(f"Buildings: {len(buildings)} | Street segs: {len(street_segs)}")
+
+    # Строим теневые полигоны ОДИН РАЗ — используются везде
+    shadow_polys = build_shadow_polys(buildings, sun_alt, sun_az)
 
     loop = asyncio.get_event_loop()
 
-    # ── 3. Первый проход анализа ──────────────────────────────────────────────
+    # ── 3. Анализ OSRM маршрутов ─────────────────────────────────────────────
     analyzed = await _analyse_batch(
         raw_routes, buildings, sun_alt, sun_az, weather,
         req.walk_speed_mps, depart_dt, loop
     )
+    log.info(f"Analysed {len(analyzed)} OSRM routes")
 
-    best_shade = max(s["shade_fraction"] for _, s, _ in analyzed) if analyzed else 0.0
-    log.info(f"Pass 1 best shade: {best_shade:.1%}")
+    # ── 4. Графовый маршрут с максимальной тенью (в thread executor) ─────────
+    shade_graph_result = await loop.run_in_executor(
+        _executor,
+        partial(
+            find_shade_route,
+            req.origin.lat, req.origin.lon,
+            req.destination.lat, req.destination.lon,
+            street_segs,
+            shadow_polys,
+            buildings,
+            sun_alt,
+            sun_az,
+        )
+    )
 
-    # ── 4. Второй проход: целевые детуры вокруг солнечных участков ────────────
-    if best_shade < 0.50 and buildings:
-        best_raw, best_stats, best_pts = max(
+    # ── 5. Анализируем графовый маршрут (если удалось построить) ─────────────
+    shade_graph_analyzed: Optional[tuple[dict, dict]] = None
+    if shade_graph_result is not None:
+        shade_path, shade_dist_m = shade_graph_result
+        # Создаём «raw» объект в том же формате что и OSRM-маршруты
+        shade_raw = {
+            "polyline": polyline_lib.encode(shade_path),
+            "coords":   shade_path,
+            "distance": shade_dist_m,
+            "duration": shade_dist_m / req.walk_speed_mps,
+        }
+        pts = interpolate_route(shade_path)
+        shade_stats = await loop.run_in_executor(
+            _executor,
+            partial(analyse_route,
+                points     = pts,
+                buildings  = buildings,
+                sun_alt    = sun_alt,
+                sun_az     = sun_az,
+                weather    = weather,
+                walk_speed = req.walk_speed_mps,
+                depart_dt  = depart_dt,
+            )
+        )
+        shade_graph_analyzed = (shade_raw, shade_stats)
+        log.info(
+            f"Shade graph route: {int(shade_dist_m)}m, "
+            f"shade={shade_stats['shade_fraction']:.1%}"
+        )
+    else:
+        log.info("Shade graph routing failed — using fallback")
+
+    # ── 6. Выбираем 3 маршрута ────────────────────────────────────────────────
+    #
+    # Маршрут 1 (route-fast): кратчайший по времени из OSRM
+    # Маршрут 2 (route-balanced): лучший баланс тень/время из OSRM
+    # Маршрут 3 (route-shade): графовый маршрут (или fallback — макс. тени OSRM)
+
+    # ── Маршрут 1: Быстрый ────────────────────────────────────────────────────
+    fast_raw, fast_stats = min(analyzed, key=lambda x: x[0]["duration"])
+    route_fast = _make_route_out("route-fast", "Быстрый", fast_raw, fast_stats)
+
+    # ── Маршрут 2: Оптимальный (время + тень) ─────────────────────────────────
+    # Нормализуем duration и sun_minutes → [0,1], минимизируем взвешенную сумму
+    min_dur = min(r["duration"] for r, _ in analyzed)
+    max_dur = max(r["duration"] for r, _ in analyzed) or 1
+    max_sun = max(s["sun_min"] for _, s in analyzed) or 1
+
+    def _balanced_score(raw: dict, stats: dict) -> float:
+        dur_norm = (raw["duration"] - min_dur) / (max_dur - min_dur + 1)
+        sun_norm = stats["sun_min"] / max_sun
+        return 0.45 * dur_norm + 0.55 * sun_norm
+
+    balanced_raw, balanced_stats = min(analyzed, key=lambda x: _balanced_score(*x))
+    route_balanced = _make_route_out(
+        "route-balanced", "Оптимальный", balanced_raw, balanced_stats
+    )
+
+    # ── Маршрут 3: Максимум тени ──────────────────────────────────────────────
+    if shade_graph_analyzed is not None:
+        shade_raw2, shade_stats2 = shade_graph_analyzed
+        route_shade = _make_route_out("route-shade", "Теневой", shade_raw2, shade_stats2)
+    else:
+        # Fallback: самый теневой из OSRM-альтернатив
+        shadow_raw, shadow_stats = max(
             analyzed, key=lambda x: x[1]["shade_fraction"]
         )
-        shade_map = best_stats.get("shade_map", "")
+        route_shade = _make_route_out("route-shade", "Теневой", shadow_raw, shadow_stats)
 
-        if shade_map:
-            hotspots = _sun_hotspots(best_pts, shade_map)
-            log.info(f"Hotspots: {hotspots}")
+    log.info(
+        f"Routes: fast={route_fast.duration_s}s shade={route_fast.metrics.shade_minutes:.1f}min | "
+        f"balanced={route_balanced.duration_s}s shade={route_balanced.metrics.shade_minutes:.1f}min | "
+        f"shade={route_shade.duration_s}s shade={route_shade.metrics.shade_minutes:.1f}min"
+    )
 
-            if hotspots:
-                o        = f"{req.origin.lon},{req.origin.lat}"
-                d        = f"{req.destination.lon},{req.destination.lat}"
-                max_dist = raw_routes[0]["distance"] * 1.7
-                seen     = {r["polyline"] for r in raw_routes}
-
-                async with httpx.AsyncClient() as client:
-                    new_raws = await _shade_targeted_routes(
-                        o, d, hotspots, client, max_dist, seen,
-                        transport=req.transport
-                    )
-                log.info(f"Targeted detours: {len(new_raws)}")
-
-                if new_raws:
-                    new_analyzed = await _analyse_batch(
-                        new_raws, buildings, sun_alt, sun_az, weather,
-                        req.walk_speed_mps, depart_dt, loop
-                    )
-                    analyzed.extend(new_analyzed)
-                    new_best = max(s["shade_fraction"] for _, s, _ in new_analyzed)
-                    log.info(f"Pass 2 best shade: {new_best:.1%}")
-
-    # ── 5. Ограничение по длительности по спецификации пресетов ──────────────
-    #   less_uv  = «Максимум тени»: duration ≤ 1.7× кратчайшего
-    #   cooler   = «Баланс тень/время»: duration ≤ 1.15× кратчайшего
-    #   fast     = «Самый быстрый»: без ограничения
-    min_dur = min(r["duration"] for r, _, _ in analyzed) if analyzed else 1
-    dur_limit = {
-        "less_uv": min_dur * 1.7,
-        "cooler":  min_dur * 1.15,
-        "fast":    float("inf"),
-    }.get(req.preset, float("inf"))
-
-    # ── 6. Строим RouteOut (дедупликация по polyline + нормализованная дистанция)
-    out_routes: list[RouteOut] = []
-    seen_poly:  set[str] = set()
-    seen_dist:  list[int] = []   # сохраняем дистанции принятых маршрутов
-
-    def _is_near_duplicate(dist_m: int) -> bool:
-        """Считаем маршруты дубликатами, если дистанция отличается < 1%."""
-        for d in seen_dist:
-            if abs(dist_m - d) / max(d, 1) < 0.01:
-                return True
-        return False
-
-    for i, (raw, stats, _) in enumerate(analyzed):
-        if raw["polyline"] in seen_poly:
-            continue
-        if raw["duration"] > dur_limit:
-            continue
-        dist = stats["distance_m"]
-        if _is_near_duplicate(dist):
-            continue
-        seen_poly.add(raw["polyline"])
-        seen_dist.append(dist)
-        out_routes.append(_make_route_out(i, raw, stats))
-
-    # Гарантируем хотя бы 1 маршрут
-    if not out_routes and analyzed:
-        raw, stats, _ = min(analyzed, key=lambda x: x[0]["duration"])
-        out_routes.append(_make_route_out(0, raw, stats))
-
-    # ── 7. Сортировка по пресету ──────────────────────────────────────────────
-    if req.preset == "less_uv":
-        out_routes.sort(key=lambda r: r.metrics.sun_minutes)
-    elif req.preset == "cooler":
-        max_sun = max(r.metrics.sun_minutes for r in out_routes) or 1
-        max_dur = max(r.duration_s for r in out_routes) or 1
-        out_routes.sort(key=lambda r:
-            0.6 * r.metrics.sun_minutes / max_sun +
-            0.4 * r.duration_s / max_dur)
-    else:
-        out_routes.sort(key=lambda r: r.duration_s)
-
-    # ── 8. Маршруты с ≥50% тени — всегда первые ──────────────────────────────
-    out_routes.sort(key=lambda r: (0 if _shade_fraction(r) >= 0.5 else 1))
-
-    return RoutesResponse(routes=out_routes[:5])
+    return RoutesResponse(routes=[route_fast, route_balanced, route_shade])
