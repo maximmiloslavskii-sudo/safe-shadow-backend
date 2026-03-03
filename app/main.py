@@ -42,7 +42,7 @@ from .ratelimit import RateLimiter
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-APP_VERSION = "0.4.1"
+APP_VERSION = "0.4.2"
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "10"))
 
 app = FastAPI(title="Safe Shadow Backend", version=APP_VERSION)
@@ -297,9 +297,9 @@ def _streets_bbox(
     минимум 400 м, максимум 1500 м от крайних точек.
     """
     direct_m = haversine_m(origin.lat, origin.lon, dest.lat, dest.lon)
-    # Ограничиваем bbox: мин 300 м, макс 800 м от крайних точек.
-    # Меньше bbox → меньше сегментов → быстрее Dijkstra.
-    pad_m    = min(max(direct_m * 0.4, 300), 800)
+    # Bbox: достаточный для max_detour=4.0 — но не слишком большой для скорости.
+    # pad = 60% от прямого расстояния, но не меньше 400м и не больше 1200м.
+    pad_m    = min(max(direct_m * 0.6, 400), 1200)
     mid_lat  = (origin.lat + dest.lat) / 2
     pad_lat  = pad_m / 111_320
     pad_lon  = pad_m / (111_320 * math.cos(math.radians(mid_lat)))
@@ -363,6 +363,8 @@ async def routes(req: RoutesRequest):
     log.info(f"Analysed {len(analyzed)} OSRM routes")
 
     # ── 4. Графовый маршрут с максимальной тенью (в thread executor) ─────────
+    # sun_penalty=5.0 → солнечный сегмент в 6× дороже теневого (агрессивно ищет тень)
+    # max_detour=4.0 → маршрут может быть до 4× длиннее прямого расстояния
     shade_graph_result = await loop.run_in_executor(
         _executor,
         partial(
@@ -374,6 +376,8 @@ async def routes(req: RoutesRequest):
             buildings,
             sun_alt,
             sun_az,
+            4.0,   # max_detour
+            5.0,   # sun_penalty
         )
     )
 
@@ -403,11 +407,12 @@ async def routes(req: RoutesRequest):
         )
         shade_graph_analyzed = (shade_raw, shade_stats)
         log.info(
-            f"Shade graph route: {int(shade_dist_m)}m, "
-            f"shade={shade_stats['shade_fraction']:.1%}"
+            f"✅ Shade graph route (OSM Dijkstra): {int(shade_dist_m)}m, "
+            f"shade={shade_stats['shade_fraction']:.1%}, "
+            f"nodes={len(shade_path)}"
         )
     else:
-        log.info("Shade graph routing failed — using fallback")
+        log.info("⚠️ Shade graph routing returned None — using OSRM fallback")
 
     # ── 6. Выбираем 3 маршрута ────────────────────────────────────────────────
     #

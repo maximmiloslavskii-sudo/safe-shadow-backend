@@ -692,54 +692,138 @@ def find_shade_route(
     direct_dist  = haversine_m(origin_lat, origin_lon, dest_lat, dest_lon)
     max_dist_m   = direct_dist * max_detour
 
-    # ── Dijkstra (минимизация sun-weighted стоимости) ─────────────────────────
-    INF       = float("inf")
-    TIMEOUT_S = 12.0   # прерываем если за 12с не нашли путь
-    t0 = time.monotonic()
+    # ── Внутренний Dijkstra (минимизация sun-weighted стоимости) ──────────────
+    def _run_dijkstra(
+        src: tuple, dst: tuple, budget_m: float, deadline: float
+    ) -> Optional[tuple[list, float, float]]:
+        """
+        Dijkstra от src до dst с ограничением по дистанции budget_m.
+        Возвращает (path_coords, total_dist_m, total_shade_dist_m) или None.
+        """
+        INF = float("inf")
+        g_cost: dict[tuple, float] = {src: 0.0}
+        g_dist: dict[tuple, float] = {src: 0.0}
+        g_shade: dict[tuple, float] = {src: 0.0}  # накопленные метры в тени
+        came: dict[tuple, Optional[tuple]] = {src: None}
+        ctr = itertools.count()
+        pq  = [(0.0, next(ctr), src)]
 
-    g_cost: dict[tuple, float] = {start: 0.0}
-    g_dist: dict[tuple, float] = {start: 0.0}
-    came:   dict[tuple, Optional[tuple]] = {start: None}
-    _ctr    = itertools.count()
-    pq      = [(0.0, next(_ctr), start)]  # (cost, tiebreak_counter, node)
-
-    while pq:
-        if time.monotonic() - t0 > TIMEOUT_S:
-            log.warning("Shade Dijkstra timeout — returning best partial result")
-            break
-
-        cost, _, node = heappop(pq)
-
-        if cost > g_cost.get(node, INF) + 1e-9:
-            continue
-        if node == goal:
-            break
-
-        cur_dist = g_dist[node]
-        for neighbor, edge_dist, edge_cost in adj.get(node, []):
-            new_dist = cur_dist + edge_dist
-            if new_dist > max_dist_m:
+        while pq:
+            if time.monotonic() > deadline:
+                log.warning("Shade Dijkstra timeout")
+                break
+            c, _, node = heappop(pq)
+            if c > g_cost.get(node, INF) + 1e-9:
                 continue
-            new_cost = cost + edge_cost
-            if new_cost < g_cost.get(neighbor, INF):
-                g_cost[neighbor] = new_cost
-                g_dist[neighbor] = new_dist
-                came[neighbor]   = node
-                heappush(pq, (new_cost, next(_ctr), neighbor))
+            if node == dst:
+                break
+            cur_dist = g_dist[node]
+            for nb, edge_dist, edge_cost in adj.get(node, []):
+                new_dist = cur_dist + edge_dist
+                if new_dist > budget_m:
+                    continue
+                new_cost = c + edge_cost
+                if new_cost < g_cost.get(nb, INF):
+                    g_cost[nb]  = new_cost
+                    g_dist[nb]  = new_dist
+                    # shade накапливаем пропорционально shade_frac ребра
+                    # shade_frac ≈ 1 - edge_cost / (dist * (1 + sun_penalty))
+                    shade_frac_approx = 1.0 - (edge_cost - edge_dist) / max(
+                        edge_dist * sun_penalty, 1e-6
+                    )
+                    g_shade[nb] = g_shade[node] + edge_dist * max(shade_frac_approx, 0.0)
+                    came[nb]    = node
+                    heappush(pq, (new_cost, next(ctr), nb))
 
-    if goal not in came:
-        log.info("Shade route: goal not reachable in graph")
+        if dst not in came:
+            return None
+        path: list[tuple[float, float]] = []
+        n: Optional[tuple] = dst
+        while n is not None:
+            path.append(node_coords[n])
+            n = came[n]
+        path.reverse()
+        if len(path) < 2:
+            return None
+        return path, g_dist[dst], g_shade.get(dst, 0.0)
+
+    deadline = time.monotonic() + 12.0
+
+    # ── Вариант A: прямой маршрут (origin → destination) ──────────────────────
+    result_a = _run_dijkstra(start, goal, max_dist_m, deadline)
+
+    # ── Вариант B: маршрут через путевую точку (крюк) ─────────────────────────
+    # Смещаем mid-точку перпендикулярно прямому маршруту на 35% direct_dist.
+    # Выбираем сторону, перпендикулярную солнцу (теневая сторона улицы).
+    # Это ГАРАНТИРУЕТ изучение других улиц, не только самого прямого пути.
+    result_b: Optional[tuple] = None
+    if direct_dist > 150:   # крюк бессмысленен для очень коротких маршрутов
+        try:
+            direct_bear = bearing_deg(origin_lat, origin_lon, dest_lat, dest_lon)
+            mid_lat = (origin_lat + dest_lat) / 2
+            mid_lon = (origin_lon + dest_lon) / 2
+            displace = min(direct_dist * 0.35, 500)  # не более 500м в сторону
+
+            # Пробуем оба направления перпендикуляра и берём более теневой узел
+            wp_candidates = [
+                offset_point(mid_lat, mid_lon, displace, (direct_bear + 90)  % 360),
+                offset_point(mid_lat, mid_lon, displace, (direct_bear - 90 + 360) % 360),
+            ]
+            # Выбираем кандидата ближе к теневой стороне от солнца
+            best_wp = max(
+                wp_candidates,
+                key=lambda wp: _shade_at_pt(wp[0], wp[1], shadow_polys, poly_tree)
+                               + _urban_canyon_shade_fast(
+                                   wp[0] - 0.0001, wp[1], wp[0] + 0.0001, wp[1],
+                                   bld_index_tuple, bld_heights, sun_alt, sun_az
+                               )
+            )
+            wp_node = _nearest(best_wp[0], best_wp[1])
+
+            if wp_node not in (start, goal):
+                # Оставшийся бюджет после первого отрезка
+                half_budget = max_dist_m
+                r1 = _run_dijkstra(start, wp_node, half_budget, deadline)
+                if r1 is not None:
+                    path1, d1, shd1 = r1
+                    r2 = _run_dijkstra(wp_node, goal, half_budget - d1, deadline)
+                    if r2 is not None:
+                        path2, d2, shd2 = r2
+                        combined_path = path1 + path2[1:]  # избегаем дублирования wp_node
+                        result_b = (combined_path, d1 + d2, shd1 + shd2)
+                        log.info(f"Waypoint route: {int(d1+d2)}m via node near "
+                                 f"({best_wp[0]:.4f},{best_wp[1]:.4f})")
+        except Exception as exc:
+            log.warning(f"Waypoint route error: {exc}")
+
+    # ── Выбираем лучший вариант по доле тени ──────────────────────────────────
+    def _shade_fraction(result) -> float:
+        if result is None:
+            return -1.0
+        _, dist, shade_dist = result
+        return shade_dist / max(dist, 1.0)
+
+    sf_a = _shade_fraction(result_a)
+    sf_b = _shade_fraction(result_b)
+
+    log.info(f"Shade route options: direct shade={sf_a:.1%} | waypoint shade={sf_b:.1%}")
+
+    if result_a is None and result_b is None:
+        log.info("Shade route: no path found")
         return None
 
-    # ── Восстановление пути ───────────────────────────────────────────────────
-    path: list[tuple[float, float]] = []
-    node: Optional[tuple] = goal
-    while node is not None:
-        path.append(node_coords[node])
-        node = came[node]
-    path.reverse()
+    # Используем вариант B (через крюк) если он заметно теневее
+    # ИЛИ если прямой маршрут слишком похож на fast-маршрут (< 1.15× direct_dist)
+    use_waypoint = False
+    if result_b is not None:
+        if result_a is None:
+            use_waypoint = True
+        elif sf_b > sf_a + 0.03:          # на 3% больше тени — берём крюк
+            use_waypoint = True
+        elif result_a[1] < direct_dist * 1.15 and result_b[1] > result_a[1] * 1.1:
+            # прямой маршрут почти совпадает с кратчайшим → форсируем крюк
+            use_waypoint = True
 
-    if len(path) < 2:
-        return None
-
-    return path, g_dist.get(goal, 0.0)
+    chosen = result_b if use_waypoint else result_a
+    path, total_dist, _ = chosen
+    return path, total_dist
