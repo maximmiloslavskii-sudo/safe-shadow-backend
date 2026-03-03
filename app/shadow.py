@@ -516,8 +516,20 @@ def _urban_canyon_shade_fast(
     if sun_alt_deg <= 1.0:
         return 0.95  # Ночь/рассвет — считаем в тени
 
+    # Если нет данных о зданиях → используем типичную городскую застройку.
+    # Это гарантирует наличие градиента по ориентации улицы даже без OSM-высот.
     if bld_index is None or len(bld_heights) == 0:
-        return 0.0
+        # Fallback: предполагаем средний городской каньон H=12м, W=14м
+        avg_H = 12.0
+        W = 14.0
+        seg_bear = bearing_deg(la1, lo1, la2, lo2)
+        street_normal = (seg_bear + 90) % 360
+        delta = ((sun_az_deg - street_normal + 360) % 360)
+        if delta > 180:
+            delta = 360 - delta
+        shadow_len   = avg_H / math.tan(math.radians(max(sun_alt_deg, 3)))
+        cross_shadow = shadow_len * abs(math.sin(math.radians(delta)))
+        return min(cross_shadow / max(W / 2, 1.0), 1.0)
 
     kd, lat0, lon0, cos_lat = bld_index
     mid_lat = (la1 + la2) / 2
@@ -796,7 +808,7 @@ def find_shade_route(
         except Exception as exc:
             log.warning(f"Waypoint route error: {exc}")
 
-    # ── Выбираем лучший вариант по доле тени ──────────────────────────────────
+    # ── Выбираем вариант: приоритет у маршрута через крюк ────────────────────
     def _shade_fraction(result) -> float:
         if result is None:
             return -1.0
@@ -806,24 +818,24 @@ def find_shade_route(
     sf_a = _shade_fraction(result_a)
     sf_b = _shade_fraction(result_b)
 
-    log.info(f"Shade route options: direct shade={sf_a:.1%} | waypoint shade={sf_b:.1%}")
+    log.info(
+        f"Shade options: direct={result_a[1] if result_a else 'None'}m shade={sf_a:.1%} | "
+        f"waypoint={result_b[1] if result_b else 'None'}m shade={sf_b:.1%}"
+    )
 
     if result_a is None and result_b is None:
-        log.info("Shade route: no path found")
+        log.info("Shade route: no path found in graph")
         return None
 
-    # Используем вариант B (через крюк) если он заметно теневее
-    # ИЛИ если прямой маршрут слишком похож на fast-маршрут (< 1.15× direct_dist)
-    use_waypoint = False
+    # Приоритет отдаём маршруту через путевую точку (крюк) —
+    # он ГАРАНТИРОВАННО проходит по другим улицам.
+    # Используем прямой Dijkstra только если крюк не построился.
     if result_b is not None:
-        if result_a is None:
-            use_waypoint = True
-        elif sf_b > sf_a + 0.03:          # на 3% больше тени — берём крюк
-            use_waypoint = True
-        elif result_a[1] < direct_dist * 1.15 and result_b[1] > result_a[1] * 1.1:
-            # прямой маршрут почти совпадает с кратчайшим → форсируем крюк
-            use_waypoint = True
+        chosen = result_b
+        log.info("Using WAYPOINT shade route (explores different streets)")
+    else:
+        chosen = result_a
+        log.info("Using DIRECT shade route (waypoint failed)")
 
-    chosen = result_b if use_waypoint else result_a
     path, total_dist, _ = chosen
     return path, total_dist
