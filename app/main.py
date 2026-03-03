@@ -42,7 +42,7 @@ from .ratelimit import RateLimiter
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.4.1"
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "10"))
 
 app = FastAPI(title="Safe Shadow Backend", version=APP_VERSION)
@@ -297,7 +297,9 @@ def _streets_bbox(
     минимум 400 м, максимум 1500 м от крайних точек.
     """
     direct_m = haversine_m(origin.lat, origin.lon, dest.lat, dest.lon)
-    pad_m    = min(max(direct_m * 0.5, 400), 1500)
+    # Ограничиваем bbox: мин 300 м, макс 800 м от крайних точек.
+    # Меньше bbox → меньше сегментов → быстрее Dijkstra.
+    pad_m    = min(max(direct_m * 0.4, 300), 800)
     mid_lat  = (origin.lat + dest.lat) / 2
     pad_lat  = pad_m / 111_320
     pad_lon  = pad_m / (111_320 * math.cos(math.radians(mid_lat)))

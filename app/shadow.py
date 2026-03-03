@@ -20,6 +20,7 @@ shadow.py — реальный расчёт тени вдоль пешеходн
 import itertools
 import math
 import logging
+import time
 from datetime import datetime, timezone
 from heapq import heappush, heappop
 from typing import Optional
@@ -27,6 +28,7 @@ from typing import Optional
 import ephem
 import httpx
 import numpy as np
+from scipy.spatial import cKDTree
 from shapely.geometry import Point, Polygon
 from shapely.strtree import STRtree
 
@@ -424,17 +426,17 @@ async def fetch_street_network(
     парковые дорожки, сервисные проезды и т.д.
     Исключает: автомагистрали, строящиеся/предложенные/заброшенные дороги.
     """
-    query = f"""[out:json][timeout:22];
-way["highway"]["highway"!~"motorway|trunk|motorway_link|trunk_link|
-                             raceway|construction|proposed|abandoned|
-                             disused|planned|escape"]
+    # Только пешеходные/жилые типы (не все highway)
+    query = f"""[out:json][timeout:18];
+way["highway"~"footway|path|pedestrian|living_street|residential|service|track|steps|unclassified|tertiary|secondary|primary"]
    ({s:.5f},{w:.5f},{n:.5f},{e:.5f});
 out body geom;"""
+    MAX_SEGS = 8000  # ограничение на кол-во сегментов для скорости Dijkstra
     try:
         r = await client.post(
             "https://overpass-api.de/api/interpreter",
             data={"data": query},
-            timeout=24,
+            timeout=20,
         )
         r.raise_for_status()
         segs: list[tuple[float, float, float, float]] = []
@@ -443,6 +445,10 @@ out body geom;"""
             for i in range(len(geo) - 1):
                 a, b = geo[i], geo[i + 1]
                 segs.append((a["lat"], a["lon"], b["lat"], b["lon"]))
+                if len(segs) >= MAX_SEGS:
+                    break
+            if len(segs) >= MAX_SEGS:
+                break
         log.info(f"Street segments fetched: {len(segs)}")
         return segs
     except Exception as exc:
@@ -451,11 +457,45 @@ out body geom;"""
 
 # ─── Физическая оценка тени по геометрии застройки ───────────────────────────
 
-def _urban_canyon_shade(
+def _build_building_index(buildings: list):
+    """
+    Строит быстрый пространственный индекс зданий (cKDTree по центроидам).
+    Возвращает (kdtree | None, lat_arr, lon_arr, heights_arr).
+    Используется для O(log N) поиска ближайших зданий вместо O(N) линейного.
+    """
+    if not buildings:
+        return None, np.empty(0), np.empty(0), np.empty(0)
+    lats, lons, heights = [], [], []
+    for b in buildings:
+        try:
+            c = b["polygon"].centroid
+            lats.append(c.y)
+            lons.append(c.x)
+            heights.append(b["height"])
+        except Exception:
+            pass
+    if not lats:
+        return None, np.empty(0), np.empty(0), np.empty(0)
+    lat_arr = np.array(lats)
+    lon_arr = np.array(lons)
+    h_arr   = np.array(heights)
+    # Приводим к локальным декартовым координатам (метры) для KDTree
+    lat0, lon0 = lat_arr.mean(), lon_arr.mean()
+    cos_lat = math.cos(math.radians(lat0))
+    y = (lat_arr - lat0) * 111_320
+    x = (lon_arr - lon0) * 111_320 * cos_lat
+    kd = cKDTree(np.column_stack([y, x]))
+    # Сохраняем ref-данные для обратного пересчёта
+    return (kd, lat0, lon0, cos_lat), lat_arr, lon_arr, h_arr
+
+
+def _urban_canyon_shade_fast(
     la1: float, lo1: float, la2: float, lo2: float,
-    buildings: list,
+    bld_index,           # кортеж (kd, lat0, lon0, cos_lat) или None
+    bld_heights: np.ndarray,
     sun_alt_deg: float,
     sun_az_deg: float,
+    search_r_m: float = 50.0,
 ) -> float:
     """
     Оценивает долю тени на сегменте улицы через физику урбан-каньона.
@@ -466,57 +506,51 @@ def _urban_canyon_shade(
     - Среднюю высоту H ближайших зданий и оценку ширины улицы W
     - H/W ratio → покрытие тротуара тенью
 
-    Формула:
+    Физика (Sky View Factor / Urban Canyon):
         shadow_reach = H / tan(sun_alt)
         cross_shadow = shadow_reach × |sin(sun_az − street_normal)|
         shade_frac   = clip(cross_shadow / (W/2), 0, 1)
+
+    Ускорена через cKDTree: O(log N) вместо O(N) по зданиям.
     """
     if sun_alt_deg <= 1.0:
         return 0.95  # Ночь/рассвет — считаем в тени
 
+    if bld_index is None or len(bld_heights) == 0:
+        return 0.0
+
+    kd, lat0, lon0, cos_lat = bld_index
     mid_lat = (la1 + la2) / 2
     mid_lon = (lo1 + lo2) / 2
     seg_bear = bearing_deg(la1, lo1, la2, lo2)
 
-    # Ищем здания в радиусе 50м от середины сегмента
-    nearby_h = []
-    for b in buildings:
-        try:
-            c = b["polygon"].centroid
-            d = haversine_m(mid_lat, mid_lon, c.y, c.x)
-            if d < 50:
-                nearby_h.append(b["height"])
-        except Exception:
-            pass
+    # Локальные метрические координаты центра сегмента
+    my = (mid_lat - lat0) * 111_320
+    mx = (mid_lon - lon0) * 111_320 * cos_lat
 
-    if not nearby_h:
-        return 0.0  # Нет зданий → нет тени
+    # Поиск ближайших зданий в радиусе search_r_m
+    idxs = kd.query_ball_point([my, mx], r=search_r_m)
+    if not idxs:
+        return 0.0
 
-    avg_H = sum(nearby_h) / len(nearby_h)
+    nearby_h = bld_heights[idxs]
+    avg_H = float(nearby_h.mean())
+    n = len(idxs)
 
-    # Оценка ширины улицы по кол-ву зданий (больше зданий → плотнее застройка)
-    if len(nearby_h) >= 4:
-        W = 8.0   # плотная застройка — узкая улица
-    elif len(nearby_h) >= 2:
-        W = 12.0
-    else:
-        W = 16.0  # редкая застройка — широкий проезд
+    # Оценка ширины улицы по кол-ву зданий (больше → плотнее застройка)
+    W = 8.0 if n >= 4 else (12.0 if n >= 2 else 16.0)
 
-    # Нормаль к улице (перпендикуляр к направлению движения)
+    # Нормаль к улице
     street_normal = (seg_bear + 90) % 360
-
-    # Угол между солнечным азимутом и нормалью к улице
     delta = ((sun_az_deg - street_normal + 360) % 360)
     if delta > 180:
-        delta = 360 - delta  # Приводим к [0, 180]
+        delta = 360 - delta
 
-    # Поперечная (поперёк улицы) компонента тени
-    shadow_len = avg_H / math.tan(math.radians(max(sun_alt_deg, 3)))
+    # Длина тени и её поперечная компонента
+    shadow_len   = avg_H / math.tan(math.radians(max(sun_alt_deg, 3)))
     cross_shadow = shadow_len * abs(math.sin(math.radians(delta)))
 
-    # Доля покрытия тротуара (половина улицы = W/2)
-    shade_frac = min(cross_shadow / max(W / 2, 1.0), 1.0)
-    return shade_frac
+    return min(cross_shadow / max(W / 2, 1.0), 1.0)
 
 # ─── Графовый маршрутизатор: максимум тени ────────────────────────────────────
 
@@ -538,41 +572,29 @@ def _shade_at_pt(
 def _edge_shade_score(
     la1: float, lo1: float, la2: float, lo2: float,
     shadow_polys: list,
-    tree_idx: Optional[STRtree],
-    buildings: list,
+    poly_tree: Optional[STRtree],
+    bld_index,           # (kd, lat0, lon0, cos_lat) или None — для быстрой физики
+    bld_heights: np.ndarray,
     sun_alt: float,
     sun_az: float,
-    n_samples: int = 3,
 ) -> float:
     """
     Вычисляет долю тени на отрезке улицы (от 0.0 до 1.0).
 
-    Использует два метода и берёт максимум:
-    1. Прямая проверка попадания в теневые полигоны (polygon containment)
-    2. Физическая модель урбан-каньона (H/W × sun geometry)
-
-    Метод 1 точнее, но требует данных по зданиям.
-    Метод 2 даёт надёжную оценку на основе геометрии застройки.
+    Два метода, берём максимум:
+    1. Полигонная проверка центра сегмента (O(log K) через STRtree)
+    2. Физика урбан-каньона через cKDTree зданий (O(log N))
     """
-    # Метод 1: полигонная проверка (3 точки вдоль сегмента)
-    poly_shade = 0.0
-    if shadow_polys:
-        hits = sum(
-            _shade_at_pt(
-                la1 + (k + 0.5) / n_samples * (la2 - la1),
-                lo1 + (k + 0.5) / n_samples * (lo2 - lo1),
-                shadow_polys, tree_idx,
-            )
-            for k in range(n_samples)
-        )
-        poly_shade = hits / n_samples
+    # Метод 1: полигонная проверка (только середина сегмента — один запрос)
+    poly_shade = _shade_at_pt(
+        (la1 + la2) / 2, (lo1 + lo2) / 2, shadow_polys, poly_tree
+    ) if shadow_polys else 0.0
 
-    # Метод 2: урбан-каньон физика
-    physics_shade = 0.0
-    if buildings and sun_alt > 1.0:
-        physics_shade = _urban_canyon_shade(la1, lo1, la2, lo2, buildings, sun_alt, sun_az)
+    # Метод 2: физика урбан-каньона с быстрым KDTree-индексом
+    physics_shade = _urban_canyon_shade_fast(
+        la1, lo1, la2, lo2, bld_index, bld_heights, sun_alt, sun_az
+    ) if sun_alt > 1.0 else 0.0
 
-    # Берём максимум (консервативная оценка — выбираем «больше тени»)
     return max(poly_shade, physics_shade)
 
 
@@ -598,12 +620,12 @@ def find_shade_route(
         - Полностью на солнце: cost = distance_m × (1 + sun_penalty)
         sun_penalty=3.0 → солнечный маршрут в 4× «дороже» теневого.
 
-    Физические параметры тени включают:
-        - Высота солнца (solar altitude) и азимут (solar azimuth)
-        - Временные переменные (time of day, day of year через ephem)
-        - Геометрия застройки: H/W ratio, ориентация улицы
-        - Sky View Factor (неявно через отношение shadow_reach / street_width)
-        - Прямая проверка на попадание в теневые полигоны зданий и деревьев
+    Физические параметры тени:
+        - solar altitude/azimuth → длина тени здания
+        - H/W ratio → Urban Canyon Index
+        - Sky View Factor (shadow_reach / street_width)
+        - Теневые полигоны от зданий/деревьев (STRtree)
+        - Пространственный cKDTree по зданиям для O(log N) поиска
 
     max_detour: максимально допустимая длина пути / прямое расстояние.
     Возвращает: ([(lat, lon), ...], total_dist_m) или None при неудаче.
@@ -611,8 +633,11 @@ def find_shade_route(
     if not street_segs:
         return None
 
-    # Строим STRtree по теневым полигонам
-    tree_idx: Optional[STRtree] = STRtree(shadow_polys) if shadow_polys else None
+    # ── Пространственные индексы ──────────────────────────────────────────────
+    poly_tree: Optional[STRtree] = STRtree(shadow_polys) if shadow_polys else None
+
+    # Быстрый KDTree по центроидам зданий для _urban_canyon_shade_fast
+    bld_index_tuple, _, _, bld_heights = _build_building_index(buildings)
 
     # ── Строим граф смежности ─────────────────────────────────────────────────
     # Узел = (lat, lon) с точностью до 5 знаков (~1 м)
@@ -633,8 +658,9 @@ def find_shade_route(
 
         shade = _edge_shade_score(
             la1, lo1, la2, lo2,
-            shadow_polys, tree_idx,
-            buildings, sun_alt, sun_az,
+            shadow_polys, poly_tree,
+            bld_index_tuple, bld_heights,
+            sun_alt, sun_az,
         )
         # Стоимость: минимизируем пребывание на солнце
         cost = d_m * (1.0 + sun_penalty * (1.0 - shade))
@@ -649,13 +675,13 @@ def find_shade_route(
     if len(all_nodes) < 2:
         return None
 
-    # ── Привязка истока и стока к ближайшим узлам графа ──────────────────────
+    # ── Привязка истока и стока через numpy (O(N) но быстро) ─────────────────
+    node_arr = np.array([(node_coords[n][0], node_coords[n][1]) for n in all_nodes])
+
     def _nearest(lat: float, lon: float) -> tuple:
-        return min(
-            all_nodes,
-            key=lambda nd: (node_coords[nd][0] - lat) ** 2
-                         + (node_coords[nd][1] - lon) ** 2
-        )
+        diffs = node_arr - np.array([lat, lon])
+        idx = int(np.argmin((diffs ** 2).sum(axis=1)))
+        return all_nodes[idx]
 
     start = _nearest(origin_lat, origin_lon)
     goal  = _nearest(dest_lat, dest_lon)
@@ -667,7 +693,10 @@ def find_shade_route(
     max_dist_m   = direct_dist * max_detour
 
     # ── Dijkstra (минимизация sun-weighted стоимости) ─────────────────────────
-    INF     = float("inf")
+    INF       = float("inf")
+    TIMEOUT_S = 12.0   # прерываем если за 12с не нашли путь
+    t0 = time.monotonic()
+
     g_cost: dict[tuple, float] = {start: 0.0}
     g_dist: dict[tuple, float] = {start: 0.0}
     came:   dict[tuple, Optional[tuple]] = {start: None}
@@ -675,6 +704,10 @@ def find_shade_route(
     pq      = [(0.0, next(_ctr), start)]  # (cost, tiebreak_counter, node)
 
     while pq:
+        if time.monotonic() - t0 > TIMEOUT_S:
+            log.warning("Shade Dijkstra timeout — returning best partial result")
+            break
+
         cost, _, node = heappop(pq)
 
         if cost > g_cost.get(node, INF) + 1e-9:
