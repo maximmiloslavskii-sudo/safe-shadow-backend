@@ -1,0 +1,36 @@
+{
+  "project": {
+    "id": "801465ba-cb54-489f-8bb1-da5ecb8d53ce",
+    "name": "safe-shadow-backend",
+    "workspace_id": "e9ee2b5e-e77b-4802-80ee-0304bef92620"
+  },
+  "environment": {
+    "id": "bbaf210c-8d60-4dca-85f9-2272971579d2",
+    "name": "production"
+  },
+  "services": [
+    {
+      "id": "167b7701-0fd9-4986-b6a8-66ae490c2d19",
+      "name": "backend",
+      "status": "placeholder"
+    },
+    {
+      "id": "92634ddc-2c97-45a1-915c-edc0ea8dc038",
+      "name": "api",
+      "status": "docker-compose-imported"
+    },
+    {
+      "id": "ca32818d-4019-43d1-ab49-c4fd581d9aae",
+      "name": "api-fBfl",
+      "status": "production-ready"
+    }
+  ],
+  "api": {
+    "token": "b667137f-30a9-44a9-b869-53e92a13c8b4",
+    "endpoint": "https://backboard.railway.com/graphql/v2"
+  },
+  "expected_deployment_url": "https://safe-shadow-backend-production.up.railway.app",
+  "deployment_status": "READY_FOR_GITHUB_INTEGRATION",
+  "git_commit": "47360d7d7e094bfa7321dfea004066ff3f11004c",
+  "git_message": "Update docker-compose restart policy for Railway compatibility"
+}

@@ -292,15 +292,28 @@ async def fetch_weather(lat, lon, client: httpx.AsyncClient) -> dict:
 
 # ─── Построение полигонов теней (переиспользуется в graph routing) ────────────
 
-def build_shadow_polys(buildings: list, sun_alt: float, sun_az: float) -> list:
+def build_shadow_polys(
+    buildings: list,
+    sun_alt: float,
+    sun_az: float,
+    leaf_factor: float = 1.0,
+) -> list:
     """
     Строит список полигонов теней (тень + контур здания) из списка объектов.
     Используется как в analyse_route, так и в find_shade_route.
+
+    leaf_factor (0.15–1.0): сезонный коэффициент листвы деревьев.
+    Применяется только к объектам типа «tree» и «forest»:
+    - зимой деревья почти не дают тени (голые ветки → 0.15)
+    - летом — полная листва → 1.0
     """
     polys: list[Polygon] = []
     if sun_alt > 3:
         for b in buildings:
-            sp = shadow_polygon(b["polygon"], b["height"], sun_alt, sun_az)
+            h = b["height"]
+            if b.get("type") in ("tree", "forest"):
+                h = h * leaf_factor          # масштабируем высоту тени деревьев
+            sp = shadow_polygon(b["polygon"], h, sun_alt, sun_az)
             if sp is not None:
                 polys.append(sp)
             polys.append(b["polygon"])
@@ -534,6 +547,21 @@ def _build_building_index(buildings: list):
 #   1. Полигоны теней (OSM-геометрия): точно, но только там где построены
 #   2. Физика урбан-каньона (cKDTree): везде, масштабируется с ориентацией улицы
 # Итог: максимум из обоих + непрерывная шкала 0.0–1.0
+
+def _leaf_factor(month: int) -> float:
+    """
+    Сезонный коэффициент листвы деревьев (0.15 зима → 1.0 лето).
+
+    Деревья в декабре–январе почти не дают тени (голые ветки);
+    в июне–августе — полная листва.
+
+    Модель: сдвинутый косинус с пиком в июле (месяц 7).
+    Диапазон: 0.15 (январь) … 1.0 (июль).
+    """
+    angle = 2 * math.pi * (month - 7) / 12   # 0 рад в июле, ±π в январе
+    raw   = (1.0 + math.cos(angle)) / 2.0    # 1.0 в июле, 0.0 в январе
+    return 0.15 + 0.85 * raw
+
 
 def _sky_view_factor(H: float, W: float) -> float:
     """

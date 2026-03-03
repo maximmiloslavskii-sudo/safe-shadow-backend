@@ -35,14 +35,15 @@ from .shadow import (
     sun_position, interpolate_route, bearing_deg, offset_point,
     fetch_buildings, fetch_weather, analyse_route,
     build_shadow_polys, fetch_street_network, find_shade_route,
-    haversine_m,
+    haversine_m, _leaf_factor,
+    _build_building_index, _point_physics_shade,
 )
 from .ratelimit import RateLimiter
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-APP_VERSION = "0.4.6"
+APP_VERSION = "0.5.0"
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "10"))
 
 app = FastAPI(title="Safe Shadow Backend", version=APP_VERSION)
@@ -58,6 +59,10 @@ OSRM_BASE_BIKE = "https://routing.openstreetmap.de/routed-bike"
 # ─── Кэш зданий (TTL 10 минут) ────────────────────────────────────────────────
 _buildings_cache: dict = {}
 _BUILDINGS_CACHE_TTL = 600
+
+# ─── Кэш сети улиц (TTL 30 минут) ─────────────────────────────────────────────
+_streets_cache: dict = {}
+_STREETS_CACHE_TTL = 1800  # 30 минут
 
 def _cache_key(coords: list) -> str:
     if not coords:
@@ -85,6 +90,32 @@ async def _fetch_buildings_cached(coords: list, client) -> list:
         return buildings
     except asyncio.TimeoutError:
         log.warning("Overpass timeout (30s) — без теней")
+        return []
+
+async def _fetch_streets_cached(
+    bbox: tuple[float, float, float, float],
+    client: httpx.AsyncClient
+) -> list:
+    """Возвращает сеть улиц из кэша (TTL 30 мин) или из Overpass API."""
+    s, w, n, e = bbox
+    key = f"{s:.3f},{w:.3f},{n:.3f},{e:.3f}"
+    now = time.time()
+    if key in _streets_cache:
+        segs, ts = _streets_cache[key]
+        if now - ts < _STREETS_CACHE_TTL:
+            log.info(f"Streets cache HIT ({len(segs)} segments)")
+            return segs
+    try:
+        segs = await asyncio.wait_for(
+            fetch_street_network(s, w, n, e, client), timeout=28.0
+        )
+        _streets_cache[key] = (segs, now)
+        if len(_streets_cache) > 20:   # не даём кэшу разрастись
+            oldest = min(_streets_cache, key=lambda k: _streets_cache[k][1])
+            del _streets_cache[oldest]
+        return segs
+    except asyncio.TimeoutError:
+        log.warning("Streets fetch timeout — пустой граф")
         return []
 
 # ─── Модели ───────────────────────────────────────────────────────────────────
@@ -343,7 +374,8 @@ async def debug_shade(req: dict):
         street_segs = await asyncio.wait_for(
             fetch_street_network(s, w, n, e, client), timeout=25.0
         )
-    shadow_polys = build_shadow_polys(buildings, sun_alt, sun_az)
+    leaf = _leaf_factor(depart_dt.month)
+    shadow_polys = build_shadow_polys(buildings, sun_alt, sun_az, leaf_factor=leaf)
 
     loop = asyncio.get_event_loop()
     shade_result = await loop.run_in_executor(
@@ -362,6 +394,74 @@ async def debug_shade(req: dict):
             "dist_m": round(shade_result[1], 1) if shade_result else None,
             "points": len(shade_result[0]) if shade_result else 0,
         } if shade_result is not None else {"found": False}
+    }
+
+
+@app.post("/best-time")
+async def best_time(req: dict):
+    """
+    Быстрый расчёт лучшего времени выхода (без OSRM и Dijkstra).
+
+    Вход:  { olat, olon, dlat, dlon }
+    Выход: { slots: [{hour, shade_score}], best_hour, best_shade }
+
+    Работает за 2–4 с вместо 2 минут у старого метода (12× fetchRoutes).
+    Алгоритм: 10 точек вдоль прямой линии → физика урбан-каньона → среднее.
+    Кэш зданий 10 мин делает повторные запросы мгновенными.
+    """
+    olat = float(req["olat"]); olon = float(req["olon"])
+    dlat = float(req["dlat"]); dlon = float(req["dlon"])
+
+    # 10 равномерных точек вдоль прямой (достаточно для оценки тени)
+    n_pts = 10
+    sample_pts = [
+        (olat + i * (dlat - olat) / (n_pts - 1),
+         olon + i * (dlon - olon) / (n_pts - 1))
+        for i in range(n_pts)
+    ]
+
+    async with httpx.AsyncClient() as client:
+        buildings = await _fetch_buildings_cached(sample_pts, client)
+
+    bld_index_tuple, _, _, bld_heights = _build_building_index(buildings)
+    seg_bear = bearing_deg(olat, olon, dlat, dlon)
+    clat = (olat + dlat) / 2
+    clon = (olon + dlon) / 2
+
+    # Используем сегодняшнюю дату (только время меняется)
+    today = datetime.now(timezone.utc).date()
+
+    slots = []
+    best_hour  = 6
+    best_shade = 0.0
+
+    for hour in range(6, 22):
+        dt = datetime(today.year, today.month, today.day, hour, 0, 0, tzinfo=timezone.utc)
+        sun_alt, sun_az = sun_position(clat, clon, dt)
+
+        if sun_alt <= 0.0:
+            # Ночью / до рассвета — солнца нет, но листовой маршрут не нужен
+            shade_score = 0.0
+        else:
+            scores = [
+                _point_physics_shade(lat, lon, seg_bear,
+                                     bld_index_tuple, bld_heights,
+                                     sun_alt, sun_az)
+                for lat, lon in sample_pts
+            ]
+            shade_score = float(sum(scores) / len(scores))
+
+        slots.append({"hour": hour, "shade_score": round(shade_score, 3)})
+
+        if shade_score > best_shade:
+            best_shade = shade_score
+            best_hour  = hour
+
+    log.info(f"/best-time: best={best_hour}:00 shade={best_shade:.1%}")
+    return {
+        "slots":      slots,
+        "best_hour":  best_hour,
+        "best_shade": round(best_shade, 3),
     }
 
 
@@ -391,15 +491,15 @@ async def routes(req: RoutesRequest):
     async with httpx.AsyncClient() as client:
         buildings, street_segs = await asyncio.gather(
             _fetch_buildings_cached(all_coords, client),
-            asyncio.wait_for(
-                fetch_street_network(*streets_bbox, client),
-                timeout=25.0
-            )
+            _fetch_streets_cached(streets_bbox, client),
         )
     log.info(f"Buildings: {len(buildings)} | Street segs: {len(street_segs)}")
 
+    # Сезонный коэффициент листвы деревьев (0.15 зима → 1.0 лето)
+    leaf = _leaf_factor(depart_dt.month)
+
     # Строим теневые полигоны ОДИН РАЗ — используются везде
-    shadow_polys = build_shadow_polys(buildings, sun_alt, sun_az)
+    shadow_polys = build_shadow_polys(buildings, sun_alt, sun_az, leaf_factor=leaf)
 
     loop = asyncio.get_event_loop()
 
@@ -413,6 +513,9 @@ async def routes(req: RoutesRequest):
     # ── 4. Графовый маршрут с максимальной тенью (в thread executor) ─────────
     # sun_penalty=5.0 → солнечный сегмент в 6× дороже теневого (агрессивно ищет тень)
     # max_detour=4.0 → маршрут может быть до 4× длиннее прямого расстояния
+    # Велосипед: снижаем sun_penalty — скорость важнее, тень менее критична
+    sun_penalty = 8.0 if req.transport == "bike" else 20.0
+
     shade_graph_result = await loop.run_in_executor(
         _executor,
         partial(
@@ -424,8 +527,8 @@ async def routes(req: RoutesRequest):
             buildings,
             sun_alt,
             sun_az,
-            1.5,   # max_detour: не длиннее 1.5× быстрого маршрута
-            20.0,  # sun_penalty: солнечный участок в 21× дороже теневого
+            1.5,           # max_detour: не длиннее 1.5× быстрого маршрута
+            sun_penalty,   # 20.0 пешком, 8.0 велосипед
         )
     )
 
