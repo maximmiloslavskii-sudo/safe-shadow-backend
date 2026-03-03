@@ -42,7 +42,7 @@ from .ratelimit import RateLimiter
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-APP_VERSION = "0.4.3"
+APP_VERSION = "0.4.4"
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "10"))
 
 app = FastAPI(title="Safe Shadow Backend", version=APP_VERSION)
@@ -315,6 +315,54 @@ def _streets_bbox(
 @app.get("/health")
 def health():
     return {"ok": True, "version": APP_VERSION}
+
+
+@app.post("/debug-shade")
+async def debug_shade(req: dict):
+    """Debug endpoint: returns intermediate shade routing info."""
+    import math as _math
+
+    olat = req["olat"]; olon = req["olon"]
+    dlat = req["dlat"]; dlon = req["dlon"]
+    dt_str = req.get("departure_time", datetime.now(timezone.utc).isoformat())
+    depart_dt = _parse_depart(dt_str)
+    clat = (olat + dlat) / 2; clon = (olon + dlon) / 2
+    sun_alt, sun_az = sun_position(clat, clon, depart_dt)
+    direct_m = haversine_m(olat, olon, dlat, dlon)
+
+    # Streets bbox
+    pad_m = min(max(direct_m * 0.6, 400), 1200)
+    mid_lat = clat; cos_lat = _math.cos(_math.radians(mid_lat))
+    pad_lat = pad_m / 111_320; pad_lon = pad_m / (111_320 * cos_lat)
+    s = min(olat, dlat) - pad_lat; n = max(olat, dlat) + pad_lat
+    w = min(olon, dlon) - pad_lon; e = max(olon, dlon) + pad_lon
+
+    import httpx
+    async with httpx.AsyncClient() as client:
+        buildings = await _fetch_buildings_cached([(olat, olon), (dlat, dlon)], client)
+        street_segs = await asyncio.wait_for(
+            fetch_street_network(s, w, n, e, client), timeout=25.0
+        )
+    shadow_polys = build_shadow_polys(buildings, sun_alt, sun_az)
+
+    loop = asyncio.get_event_loop()
+    shade_result = await loop.run_in_executor(
+        _executor,
+        partial(find_shade_route, olat, olon, dlat, dlon,
+                street_segs, shadow_polys, buildings, sun_alt, sun_az, 4.0, 5.0)
+    )
+
+    return {
+        "sun_alt": round(sun_alt, 2), "sun_az": round(sun_az, 2),
+        "direct_m": round(direct_m, 1),
+        "buildings": len(buildings), "street_segs": len(street_segs),
+        "shadow_polys": len(shadow_polys),
+        "shade_route": {
+            "found": shade_result is not None,
+            "dist_m": round(shade_result[1], 1) if shade_result else None,
+            "points": len(shade_result[0]) if shade_result else 0,
+        } if shade_result is not None else {"found": False}
+    }
 
 
 @app.post("/routes", response_model=RoutesResponse)
