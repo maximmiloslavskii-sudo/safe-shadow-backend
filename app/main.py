@@ -42,7 +42,7 @@ from .ratelimit import RateLimiter
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-APP_VERSION = "0.4.4"
+APP_VERSION = "0.4.5"
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "10"))
 
 app = FastAPI(title="Safe Shadow Backend", version=APP_VERSION)

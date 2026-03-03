@@ -427,16 +427,15 @@ async def fetch_street_network(
     Исключает: автомагистрали, строящиеся/предложенные/заброшенные дороги.
     """
     # Только пешеходные/жилые типы (не все highway)
-    query = f"""[out:json][timeout:18];
+    query = f"""[out:json][timeout:25];
 way["highway"~"footway|path|pedestrian|living_street|residential|service|track|steps|unclassified|tertiary|secondary|primary"]
    ({s:.5f},{w:.5f},{n:.5f},{e:.5f});
 out body geom;"""
-    MAX_SEGS = 8000  # ограничение на кол-во сегментов для скорости Dijkstra
     try:
         r = await client.post(
             "https://overpass-api.de/api/interpreter",
             data={"data": query},
-            timeout=20,
+            timeout=28,
         )
         r.raise_for_status()
         segs: list[tuple[float, float, float, float]] = []
@@ -445,10 +444,6 @@ out body geom;"""
             for i in range(len(geo) - 1):
                 a, b = geo[i], geo[i + 1]
                 segs.append((a["lat"], a["lon"], b["lat"], b["lon"]))
-                if len(segs) >= MAX_SEGS:
-                    break
-            if len(segs) >= MAX_SEGS:
-                break
         log.info(f"Street segments fetched: {len(segs)}")
         return segs
     except Exception as exc:
@@ -704,6 +699,13 @@ def find_shade_route(
     direct_dist  = haversine_m(origin_lat, origin_lon, dest_lat, dest_lon)
     max_dist_m   = direct_dist * max_detour
 
+    start_snap = haversine_m(origin_lat, origin_lon, node_coords[start][0], node_coords[start][1])
+    goal_snap  = haversine_m(dest_lat, dest_lon, node_coords[goal][0], node_coords[goal][1])
+    log.info(
+        f"Graph: {len(adj)} nodes | direct={direct_dist:.0f}m | "
+        f"start_snap={start_snap:.0f}m | goal_snap={goal_snap:.0f}m | budget={max_dist_m:.0f}m"
+    )
+
     # ── Внутренний Dijkstra (минимизация sun-weighted стоимости) ──────────────
     def _run_dijkstra(
         src: tuple, dst: tuple, budget_m: float, deadline: float
@@ -759,10 +761,19 @@ def find_shade_route(
             return None
         return path, g_dist[dst], g_shade.get(dst, 0.0)
 
-    deadline = time.monotonic() + 12.0
+    deadline = time.monotonic() + 15.0
 
     # ── Вариант A: прямой маршрут (origin → destination) ──────────────────────
     result_a = _run_dijkstra(start, goal, max_dist_m, deadline)
+    if result_a is None:
+        # Fallback: retry with no distance cap — catches disconnected-looking graphs
+        # where the snap adds enough extra distance to exceed budget
+        log.warning(
+            f"Dijkstra returned None with budget {max_dist_m:.0f}m — retrying unlimited"
+        )
+        result_a = _run_dijkstra(start, goal, float("inf"), deadline)
+        if result_a is None:
+            log.warning("Dijkstra failed even without budget — graph may be disconnected")
 
     # ── Вариант B: маршрут через путевую точку (крюк) ─────────────────────────
     # Смещаем mid-точку перпендикулярно прямому маршруту на 35% direct_dist.
