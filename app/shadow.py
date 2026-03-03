@@ -310,63 +310,94 @@ def build_shadow_polys(buildings: list, sun_alt: float, sun_az: float) -> list:
 
 def analyse_route(points, buildings, sun_alt, sun_az, weather,
                   walk_speed=1.35, depart_dt=None):
+    """
+    Анализирует маршрут и возвращает метрики тени.
+
+    shade_fraction вычисляется СОГЛАСОВАННО с Dijkstra: та же физика (SVF,
+    H/W, ориентация улицы) + полигоны теней. Благодаря этому процент тени
+    у маршрута «Теневой» реально отражает то, что он оптимизировал.
+
+    Физические переменные:
+      - Астрономические:  sun_alt, sun_az (из ephem)
+      - Геометрия:        H (высота зданий), W (ширина улицы), H/W ratio
+      - SVF:              Sky View Factor = W / √(W²+H²)
+      - shadow_len:       H / tan(sun_alt)   — длина тени
+      - cross_shadow:     shadow_len × |sin(Δaz)|  — поперечная компонента
+      - Атмосфера:        cloud_cover, uv_index, temp_c
+    """
     if depart_dt is None:
         depart_dt = datetime.now(timezone.utc)
 
     shadow_polys = build_shadow_polys(buildings, sun_alt, sun_az)
-    tree = STRtree(shadow_polys) if shadow_polys else None
+    poly_tree    = STRtree(shadow_polys) if shadow_polys else None
+
+    # Пространственный индекс зданий — для физической модели тени
+    bld_index_tuple, _, _, bld_heights = _build_building_index(buildings)
 
     cloud_factor = max(0, 1 - weather["cloud_cover"] / 100 * 0.7)
     uv_base      = weather["uv_index"] * cloud_factor
 
-    shade_pts  = 0
-    sun_pts    = 0
+    shade_acc  = 0.0   # накопленный вес тени (непрерывный, не двоичный)
     uv_total   = 0.0
     heat_total = 0.0
     side_guidance: list[dict] = []
     last_side  = None
     dist_acc   = 0.0
-    shade_seq: list[bool] = []
+    shade_seq: list[bool] = []   # для shade_map (пороговое значение 0.4)
+    n_pts      = 0
 
     for i, (lat, lon) in enumerate(points):
-        pt = Point(lon, lat)
+        n_pts += 1
 
-        in_shade = False
-        if tree is not None:
-            candidates = tree.query(pt)
-            for idx in candidates:
+        # ── Направление улицы в этой точке ──────────────────────────────────
+        if i < len(points) - 1:
+            seg_b = bearing_deg(lat, lon, points[i + 1][0], points[i + 1][1])
+        elif i > 0:
+            seg_b = bearing_deg(points[i - 1][0], points[i - 1][1], lat, lon)
+        else:
+            seg_b = 0.0
+
+        # ── Метод 1: полигонная проверка (OSM-геометрия) ─────────────────────
+        pt = Point(lon, lat)
+        poly_shade = 0.0
+        if poly_tree is not None:
+            for idx in poly_tree.query(pt):
                 if shadow_polys[idx].contains(pt):
-                    in_shade = True
+                    poly_shade = 1.0
                     break
 
+        # ── Метод 2: физика урбан-каньона (SVF + H/W + ориентация) ──────────
+        phys_shade = _point_physics_shade(
+            lat, lon, seg_b,
+            bld_index_tuple, bld_heights,
+            sun_alt, sun_az,
+        ) if sun_alt > 1.0 else 0.0
+
+        # Итоговая тень: полигоны точны → полный вес; физика 90%
+        shade_score = max(poly_shade, phys_shade * 0.90)
+        shade_acc  += shade_score
+
+        # Двоичный флаг для side_guidance и shade_map (порог 0.4)
+        in_shade = shade_score >= 0.4
         shade_seq.append(in_shade)
 
-        if in_shade:
-            shade_pts += 1
-            uv_pt      = uv_base * 0.05
-        else:
-            sun_pts   += 1
-            uv_pt      = uv_base
-
-        uv_total   += uv_pt
+        # УФ и тепловая нагрузка
+        uv_total   += uv_base * (0.05 if in_shade else 1.0)
         heat_total += weather["temp_c"] * (0.6 if in_shade else 1.0)
 
-        if i < len(points) - 1 and tree is not None:
-            seg_b = bearing_deg(lat, lon, points[i+1][0], points[i+1][1])
-            ll, rl = offset_point(lat, lon, SIDE_OFFSET_M, (seg_b - 90) % 360), \
-                     offset_point(lat, lon, SIDE_OFFSET_M, (seg_b + 90) % 360)
+        # ── Сторона улицы для подсказки ──────────────────────────────────────
+        if i < len(points) - 1 and poly_tree is not None:
+            ll = offset_point(lat, lon, SIDE_OFFSET_M, (seg_b - 90) % 360)
+            rl = offset_point(lat, lon, SIDE_OFFSET_M, (seg_b + 90) % 360)
             lp = Point(ll[1], ll[0])
             rp = Point(rl[1], rl[0])
-
-            left_sh  = any(shadow_polys[j].contains(lp) for j in tree.query(lp))
-            right_sh = any(shadow_polys[j].contains(rp) for j in tree.query(rp))
-
+            left_sh  = any(shadow_polys[j].contains(lp) for j in poly_tree.query(lp))
+            right_sh = any(shadow_polys[j].contains(rp) for j in poly_tree.query(rp))
             best_side = None
             if left_sh and not right_sh:
                 best_side = "left"
             elif right_sh and not left_sh:
                 best_side = "right"
-
             if best_side and best_side != last_side:
                 seg_dist = int(dist_acc)
                 if last_side is not None:
@@ -380,12 +411,12 @@ def analyse_route(points, buildings, sun_alt, sun_az, weather,
                 last_side = best_side
 
         if i > 0:
-            dist_acc += haversine_m(points[i-1][0], points[i-1][1], lat, lon)
+            dist_acc += haversine_m(points[i - 1][0], points[i - 1][1], lat, lon)
 
-    total_pts  = shade_pts + sun_pts or 1
+    total_pts  = max(n_pts, 1)
     total_m    = dist_acc
     duration_s = total_m / walk_speed
-    shade_frac = shade_pts / total_pts
+    shade_frac = shade_acc / total_pts   # непрерывный 0–1
     shade_min  = duration_s * shade_frac / 60
     sun_min    = duration_s * (1 - shade_frac) / 60
     avg_uv     = uv_total / total_pts
@@ -484,89 +515,90 @@ def _build_building_index(buildings: list):
     return (kd, lat0, lon0, cos_lat), lat_arr, lon_arr, h_arr
 
 
-def _urban_canyon_shade_fast(
-    la1: float, lo1: float, la2: float, lo2: float,
-    bld_index,           # кортеж (kd, lat0, lon0, cos_lat) или None
-    bld_heights: np.ndarray,
-    sun_alt_deg: float,
-    sun_az_deg: float,
-    search_r_m: float = 50.0,
+# ─── Комплексная физика тени: SVF + урбан-каньон ─────────────────────────────
+#
+# Переменные модели:
+#   Прямые астрономические:   sun_alt (высота солнца), sun_az (азимут солнца)
+#   Геометрия застройки:      H (высота здания), W (ширина улицы), H/W ratio
+#   Ориентация улицы:         seg_bearing (азимут оси), street_normal (перпендикуляр)
+#   Угол падения лучей:       delta = |sun_az − street_normal|
+#
+#   Вычисляемые:
+#     shadow_len = H / tan(sun_alt)           — длина тени от здания
+#     cross_shadow = shadow_len × |sin(delta)| — поперечная компонента тени
+#     SVF = W / √(W² + H²)                    — Sky View Factor (каньон)
+#     shade_raw = cross_shadow / (W/2)         — покрытие тротуара тенью
+#     shade = shade_raw + (1−SVF)×0.25        — с бонусом за глубокий каньон
+#
+# Два независимых метода, используемых совместно:
+#   1. Полигоны теней (OSM-геометрия): точно, но только там где построены
+#   2. Физика урбан-каньона (cKDTree): везде, масштабируется с ориентацией улицы
+# Итог: максимум из обоих + непрерывная шкала 0.0–1.0
+
+def _sky_view_factor(H: float, W: float) -> float:
+    """
+    SVF — коэффициент видимости неба для симметричного городского каньона.
+
+        SVF = W / √(W² + H²)
+
+    SVF=1.0 → открытое небо (широкая улица, нет зданий)
+    SVF=0.0 → закрытый каньон (узкая улица, очень высокие здания)
+
+    Низкий SVF → больше диффузной тени даже когда прямые лучи не падают.
+    """
+    if H <= 0:
+        return 1.0
+    return W / math.sqrt(W ** 2 + H ** 2)
+
+
+def _canyon_shade_fraction(
+    H: float, W: float,
+    seg_bearing: float,
+    sun_az: float, sun_alt: float,
 ) -> float:
     """
-    Оценивает долю тени на сегменте улицы через физику урбан-каньона.
+    Доля тени на тротуаре из физики урбан-каньона (0.0–1.0).
 
-    Использует:
-    - Высоту солнца (solar altitude) → длина тени от здания
-    - Азимут солнца vs ориентация улицы → поперечная компонента тени
-    - Среднюю высоту H ближайших зданий и оценку ширины улицы W
-    - H/W ratio → покрытие тротуара тенью
+    Физика:
+      1. shadow_len = H / tan(sun_alt)          — длина тени от здания
+      2. cross = shadow_len × |sin(sun_az − street_normal)|  — поперечная компонента
+      3. shade_raw = cross / (W/2)              — покрытие (W/2 = расстояние до центра)
+      4. SVF-бонус: (1−SVF)×0.25               — диффузная тень в глубоком каньоне
 
-    Физика (Sky View Factor / Urban Canyon):
-        shadow_reach = H / tan(sun_alt)
-        cross_shadow = shadow_reach × |sin(sun_az − street_normal)|
-        shade_frac   = clip(cross_shadow / (W/2), 0, 1)
-
-    Ускорена через cKDTree: O(log N) вместо O(N) по зданиям.
+    Параметры:
+      H: средняя высота ближайших зданий (м)
+      W: ширина улицы curb-to-curb (м)
+      seg_bearing: азимут оси улицы (°)
+      sun_az: азимут солнца (°)
+      sun_alt: высота солнца (°)
     """
-    if sun_alt_deg <= 1.0:
-        return 0.95  # Ночь/рассвет — считаем в тени
-
-    # Если нет данных о зданиях → используем типичную городскую застройку.
-    # Это гарантирует наличие градиента по ориентации улицы даже без OSM-высот.
-    if bld_index is None or len(bld_heights) == 0:
-        # Fallback: предполагаем средний городской каньон H=12м, W=14м
-        avg_H = 12.0
-        W = 14.0
-        seg_bear = bearing_deg(la1, lo1, la2, lo2)
-        street_normal = (seg_bear + 90) % 360
-        delta = ((sun_az_deg - street_normal + 360) % 360)
-        if delta > 180:
-            delta = 360 - delta
-        shadow_len   = avg_H / math.tan(math.radians(max(sun_alt_deg, 3)))
-        cross_shadow = shadow_len * abs(math.sin(math.radians(delta)))
-        return min(cross_shadow / max(W / 2, 1.0), 1.0)
-
-    kd, lat0, lon0, cos_lat = bld_index
-    mid_lat = (la1 + la2) / 2
-    mid_lon = (lo1 + lo2) / 2
-    seg_bear = bearing_deg(la1, lo1, la2, lo2)
-
-    # Локальные метрические координаты центра сегмента
-    my = (mid_lat - lat0) * 111_320
-    mx = (mid_lon - lon0) * 111_320 * cos_lat
-
-    # Поиск ближайших зданий в радиусе search_r_m
-    idxs = kd.query_ball_point([my, mx], r=search_r_m)
-    if not idxs:
+    if sun_alt <= 1.0:
+        return 0.95    # ночь / рассвет
+    if H <= 0:
         return 0.0
 
-    nearby_h = bld_heights[idxs]
-    avg_H = float(nearby_h.mean())
-    n = len(idxs)
-
-    # Оценка ширины улицы по кол-ву зданий (больше → плотнее застройка)
-    W = 8.0 if n >= 4 else (12.0 if n >= 2 else 16.0)
-
-    # Нормаль к улице
-    street_normal = (seg_bear + 90) % 360
-    delta = ((sun_az_deg - street_normal + 360) % 360)
+    street_normal = (seg_bearing + 90) % 360
+    delta = ((sun_az - street_normal + 360) % 360)
     if delta > 180:
-        delta = 360 - delta
+        delta = 360 - delta  # delta ∈ [0°, 90°]
 
-    # Длина тени и её поперечная компонента
-    shadow_len   = avg_H / math.tan(math.radians(max(sun_alt_deg, 3)))
+    shadow_len   = H / math.tan(math.radians(max(sun_alt, 3.0)))
     cross_shadow = shadow_len * abs(math.sin(math.radians(delta)))
+    shade_raw    = cross_shadow / max(W / 2.0, 1.0)
 
-    return min(cross_shadow / max(W / 2, 1.0), 1.0)
+    # SVF-бонус: глубокий каньон даёт дополнительную рассеянную тень
+    svf   = _sky_view_factor(H, W)
+    bonus = (1.0 - svf) * 0.25
 
-# ─── Графовый маршрутизатор: максимум тени ────────────────────────────────────
+    return min(shade_raw + bonus, 1.0)
+
 
 def _shade_at_pt(
     lat: float, lon: float,
     shadow_polys: list,
     tree_idx: Optional[STRtree],
 ) -> float:
-    """Возвращает 1.0 если точка в тени, иначе 0.0."""
+    """Возвращает 1.0 если точка внутри теневого полигона, иначе 0.0."""
     if tree_idx is None:
         return 0.0
     pt = Point(lon, lat)
@@ -576,33 +608,107 @@ def _shade_at_pt(
     return 0.0
 
 
+def _point_physics_shade(
+    lat: float, lon: float,
+    seg_bearing: float,
+    bld_index,
+    bld_heights: np.ndarray,
+    sun_alt: float, sun_az: float,
+    search_r_m: float = 40.0,
+) -> float:
+    """
+    Физическая оценка тени в конкретной точке (урбан-каньон + SVF).
+
+    Ищет ближайшие здания через cKDTree (O(log N)).
+    Возвращает 0.0–1.0 на основе H/W ratio и ориентации улицы.
+    """
+    if sun_alt <= 1.0:
+        return 0.95
+
+    # Нет данных о зданиях → типичная московская застройка
+    if bld_index is None or len(bld_heights) == 0:
+        return _canyon_shade_fraction(12.0, 14.0, seg_bearing, sun_az, sun_alt)
+
+    kd, lat0, lon0, cos_lat = bld_index
+    py = (lat - lat0) * 111_320
+    px = (lon - lon0) * 111_320 * cos_lat
+    idxs = kd.query_ball_point([py, px], r=search_r_m)
+    if not idxs:
+        # Нет зданий рядом — открытое пространство
+        return 0.0
+
+    h_arr = bld_heights[idxs]
+    H = float(h_arr.mean())
+    n = len(idxs)
+    # Оценка ширины улицы: плотнее застройка → уже улица
+    W = 7.0 if n >= 8 else (10.0 if n >= 4 else (13.0 if n >= 2 else 16.0))
+
+    return _canyon_shade_fraction(H, W, seg_bearing, sun_az, sun_alt)
+
+
+def _segment_shade_score(
+    la1: float, lo1: float, la2: float, lo2: float,
+    shadow_polys: list,
+    poly_tree: Optional[STRtree],
+    bld_index,
+    bld_heights: np.ndarray,
+    sun_alt: float, sun_az: float,
+    n_samples: int = 3,
+) -> float:
+    """
+    Унифицированная оценка тени для отрезка улицы (0.0–1.0).
+
+    ИСПОЛЬЗУЕТСЯ ВЕЗДЕ: в Dijkstra (веса рёбер) И в analyse_route (shade_fraction).
+    Это гарантирует согласованность — маршрут оптимизируется и измеряется
+    одной и той же функцией.
+
+    Алгоритм:
+      Для n_samples равномерно расставленных точек вдоль отрезка:
+        1. Полигонная проверка (OSM-геометрия): точно, но покрывает ~15-20% улиц
+        2. Физика урбан-каньона (H/W, SVF, ориентация): везде, даёт градиент
+        score = max(poly_shade, physics_shade × 0.9)
+      Итог = среднее по точкам.
+
+    n_samples=3 для Dijkstra (быстро), n_samples=5 для analyse_route (точнее).
+    """
+    if sun_alt <= 1.0:
+        return 0.95
+
+    seg_bear = bearing_deg(la1, lo1, la2, lo2)
+    ts = [i / (n_samples - 1) for i in range(n_samples)] if n_samples > 1 else [0.5]
+    total = 0.0
+
+    for t in ts:
+        lat = la1 + t * (la2 - la1)
+        lon = lo1 + t * (lo2 - lo1)
+
+        poly  = _shade_at_pt(lat, lon, shadow_polys, poly_tree) if shadow_polys else 0.0
+        phys  = _point_physics_shade(
+            lat, lon, seg_bear, bld_index, bld_heights, sun_alt, sun_az
+        )
+        # Полигоны более точны → полный вес; физика — 90%
+        total += max(poly, phys * 0.90)
+
+    return total / len(ts)
+
+
+# Обратная совместимость: старый edge scorer → новая функция
 def _edge_shade_score(
     la1: float, lo1: float, la2: float, lo2: float,
     shadow_polys: list,
     poly_tree: Optional[STRtree],
-    bld_index,           # (kd, lat0, lon0, cos_lat) или None — для быстрой физики
+    bld_index,
     bld_heights: np.ndarray,
     sun_alt: float,
     sun_az: float,
 ) -> float:
-    """
-    Вычисляет долю тени на отрезке улицы (от 0.0 до 1.0).
-
-    Два метода, берём максимум:
-    1. Полигонная проверка центра сегмента (O(log K) через STRtree)
-    2. Физика урбан-каньона через cKDTree зданий (O(log N))
-    """
-    # Метод 1: полигонная проверка (только середина сегмента — один запрос)
-    poly_shade = _shade_at_pt(
-        (la1 + la2) / 2, (lo1 + lo2) / 2, shadow_polys, poly_tree
-    ) if shadow_polys else 0.0
-
-    # Метод 2: физика урбан-каньона с быстрым KDTree-индексом
-    physics_shade = _urban_canyon_shade_fast(
-        la1, lo1, la2, lo2, bld_index, bld_heights, sun_alt, sun_az
-    ) if sun_alt > 1.0 else 0.0
-
-    return max(poly_shade, physics_shade)
+    return _segment_shade_score(
+        la1, lo1, la2, lo2,
+        shadow_polys, poly_tree,
+        bld_index, bld_heights,
+        sun_alt, sun_az,
+        n_samples=3,
+    )
 
 
 def find_shade_route(

@@ -42,7 +42,7 @@ from .ratelimit import RateLimiter
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-APP_VERSION = "0.4.5"
+APP_VERSION = "0.4.6"
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "10"))
 
 app = FastAPI(title="Safe Shadow Backend", version=APP_VERSION)
@@ -349,7 +349,7 @@ async def debug_shade(req: dict):
     shade_result = await loop.run_in_executor(
         _executor,
         partial(find_shade_route, olat, olon, dlat, dlon,
-                street_segs, shadow_polys, buildings, sun_alt, sun_az, 4.0, 5.0)
+                street_segs, shadow_polys, buildings, sun_alt, sun_az, 1.5, 20.0)
     )
 
     return {
@@ -424,8 +424,8 @@ async def routes(req: RoutesRequest):
             buildings,
             sun_alt,
             sun_az,
-            4.0,   # max_detour
-            5.0,   # sun_penalty
+            1.5,   # max_detour: не длиннее 1.5× быстрого маршрута
+            20.0,  # sun_penalty: солнечный участок в 21× дороже теневого
         )
     )
 
