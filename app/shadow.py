@@ -739,6 +739,147 @@ def _edge_shade_score(
     )
 
 
+def find_shade_loop(
+    origin_lat: float,
+    origin_lon: float,
+    target_dist_m: float,
+    street_segs: list,
+    shadow_polys: list,
+    buildings: list,
+    sun_alt: float,
+    sun_az: float,
+    sun_penalty: float = 20.0,
+) -> Optional[tuple[list[tuple[float, float]], float]]:
+    """
+    Строит круговой маршрут (петлю) с максимальной долей тени.
+
+    Алгоритм:
+    1. Генерируем 8 кандидат-точек вокруг origin (N, NE, E, … NW)
+       на расстоянии target_dist_m / 3 от origin.
+    2. Для каждой: Dijkstra origin → waypoint (тень-оптимизация).
+    3. Выбираем waypoint с наибольшей долей тени.
+    4. Замыкаем петлю: origin → best_wp → origin.
+
+    Возвращает ([(lat, lon), ...], total_dist_m) или None.
+    """
+    if not street_segs:
+        return None
+
+    poly_tree: Optional[STRtree] = STRtree(shadow_polys) if shadow_polys else None
+    bld_index_tuple, _, _, bld_heights = _build_building_index(buildings)
+
+    PREC = 5
+    adj: dict[tuple, list] = {}
+    node_coords: dict[tuple, tuple] = {}
+
+    def _nid(lat: float, lon: float) -> tuple:
+        return (round(lat, PREC), round(lon, PREC))
+
+    for la1, lo1, la2, lo2 in street_segs:
+        d_m = haversine_m(la1, lo1, la2, lo2)
+        if d_m < 0.5:
+            continue
+        n1, n2 = _nid(la1, lo1), _nid(la2, lo2)
+        node_coords[n1] = (la1, lo1)
+        node_coords[n2] = (la2, lo2)
+        shade = _edge_shade_score(la1, lo1, la2, lo2, shadow_polys, poly_tree,
+                                  bld_index_tuple, bld_heights, sun_alt, sun_az)
+        cost = d_m * (1.0 + sun_penalty * (1.0 - shade))
+        adj.setdefault(n1, []).append((n2, d_m, cost))
+        adj.setdefault(n2, []).append((n1, d_m, cost))
+
+    if not adj:
+        return None
+
+    all_nodes = list(adj.keys())
+    node_arr  = np.array([(node_coords[n][0], node_coords[n][1]) for n in all_nodes])
+
+    def _nearest(lat: float, lon: float) -> tuple:
+        diffs = node_arr - np.array([lat, lon])
+        idx   = int(np.argmin((diffs ** 2).sum(axis=1)))
+        return all_nodes[idx]
+
+    def _dijkstra(src: tuple, dst: tuple, budget_m: float, deadline: float):
+        INF = float("inf")
+        g_cost:  dict = {src: 0.0}
+        g_dist:  dict = {src: 0.0}
+        g_shade: dict = {src: 0.0}
+        came:    dict = {src: None}
+        ctr = itertools.count()
+        pq  = [(0.0, next(ctr), src)]
+        while pq:
+            if time.monotonic() > deadline:
+                break
+            c, _, node = heappop(pq)
+            if c > g_cost.get(node, INF) + 1e-9:
+                continue
+            if node == dst:
+                break
+            for nb, ed, ec in adj.get(node, []):
+                nd = g_dist[node] + ed
+                if nd > budget_m:
+                    continue
+                nc = c + ec
+                if nc < g_cost.get(nb, INF):
+                    g_cost[nb]  = nc
+                    g_dist[nb]  = nd
+                    sf = 1.0 - (ec - ed) / max(ed * sun_penalty, 1e-6)
+                    g_shade[nb] = g_shade[node] + ed * max(sf, 0.0)
+                    came[nb]    = node
+                    heappush(pq, (nc, next(ctr), nb))
+        if dst not in came:
+            return None
+        path, n = [], dst
+        while n is not None:
+            path.append(node_coords[n])
+            n = came[n]
+        path.reverse()
+        return path, g_dist.get(dst, 0.0), g_shade.get(dst, 0.0)
+
+    start    = _nearest(origin_lat, origin_lon)
+    deadline = time.monotonic() + 22.0
+    half_budget = target_dist_m * 0.7   # чуть больше половины — достаточно для петли
+
+    # 8 кандидат-точек на расстоянии ~1/3 target вокруг origin
+    wp_dist = target_dist_m / 3.0
+    candidates = []
+    for bearing in range(0, 360, 45):
+        wp_lat, wp_lon = offset_point(origin_lat, origin_lon, wp_dist, bearing)
+        wp_node = _nearest(wp_lat, wp_lon)
+        if wp_node != start:
+            candidates.append(wp_node)
+
+    best_loop: Optional[tuple] = None
+    best_shade_frac = -1.0
+
+    for wp in candidates:
+        if time.monotonic() > deadline:
+            break
+        r1 = _dijkstra(start, wp, half_budget, deadline)
+        if r1 is None:
+            continue
+        path1, d1, shd1 = r1
+        r2 = _dijkstra(wp, start, half_budget, deadline)
+        if r2 is None:
+            continue
+        path2, d2, shd2 = r2
+        total_dist  = d1 + d2
+        total_shade = shd1 + shd2
+        sf = total_shade / max(total_dist, 1.0)
+        if sf > best_shade_frac:
+            best_shade_frac = sf
+            best_loop       = (path1 + path2[1:], total_dist)
+        log.info(f"Loop candidate bearing={bearing if bearing else '?'}: "
+                 f"dist={int(total_dist)}m shade={sf:.1%}")
+
+    if best_loop is None:
+        log.warning("find_shade_loop: no loop found")
+        return None
+
+    log.info(f"Best loop: {int(best_loop[1])}m shade={best_shade_frac:.1%}")
+    return best_loop
+
+
 def find_shade_route(
     origin_lat: float,
     origin_lon: float,

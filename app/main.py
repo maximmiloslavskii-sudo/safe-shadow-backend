@@ -35,6 +35,7 @@ from .shadow import (
     sun_position, interpolate_route, bearing_deg, offset_point,
     fetch_buildings, fetch_weather, analyse_route,
     build_shadow_polys, fetch_street_network, find_shade_route,
+    find_shade_loop,
     haversine_m, _leaf_factor,
     _build_building_index, _point_physics_shade,
 )
@@ -463,6 +464,106 @@ async def best_time(req: dict):
         "best_hour":  best_hour,
         "best_shade": round(best_shade, 3),
     }
+
+
+@app.post("/shade-walk")
+async def shade_walk(req: dict):
+    """
+    PRO: Генерирует круговой маршрут с максимальной тенью без конечной точки.
+
+    Вход:  { lat, lon, duration_min, transport }
+    Выход: { polyline, distance_m, duration_s, shade_fraction, shade_map }
+
+    Алгоритм:
+      1. Вычислить целевую дистанцию: speed × duration_min × 60
+      2. Получить здания и сеть улиц из кэша
+      3. find_shade_loop() — Dijkstra по 8 кандидатным точкам вокруг origin
+      4. Проанализировать маршрут, вернуть метрики
+    """
+    lat          = float(req["lat"])
+    lon          = float(req["lon"])
+    duration_min = int(req.get("duration_min", 30))
+    transport    = req.get("transport", "foot")
+
+    # Целевая дистанция
+    walk_speed  = 4.0 if transport == "bike" else 1.35   # м/с
+    target_dist = walk_speed * duration_min * 60          # метры
+
+    # Загружаем данные (с кэшем)
+    pad    = max(0.015, target_dist / 111_000 * 1.5)
+    bbox   = (lat - pad, lon - pad, lat + pad, lon + pad)
+    coords = [(lat, lon)]
+
+    async with httpx.AsyncClient() as client:
+        buildings, street_segs = await asyncio.gather(
+            _fetch_buildings_cached(coords, client),
+            _fetch_streets_cached(bbox, client),
+        )
+
+    depart_dt = datetime.now(timezone.utc)
+    sun_alt, sun_az = sun_position(lat, lon, depart_dt)
+    leaf        = _leaf_factor(depart_dt.month)
+    sun_penalty = 8.0 if transport == "bike" else 20.0
+    shadow_polys = build_shadow_polys(buildings, sun_alt, sun_az, leaf_factor=leaf)
+
+    loop = asyncio.get_event_loop()
+    loop_result = await loop.run_in_executor(
+        _executor,
+        partial(
+            find_shade_loop,
+            lat, lon,
+            target_dist,
+            street_segs,
+            shadow_polys,
+            buildings,
+            sun_alt,
+            sun_az,
+            sun_penalty,
+        )
+    )
+
+    if loop_result is None:
+        raise HTTPException(status_code=422, detail="Не удалось построить круговой маршрут")
+
+    path, total_dist = loop_result
+
+    # Кодируем полилинию
+    polyline_str = _encode_polyline(path)
+
+    # Анализируем маршрут
+    weather  = {"uv_index": 3.0, "cloud_cover": 30.0, "temp_c": 25.0}
+    metrics  = analyse_route(path, buildings, sun_alt, sun_az, weather,
+                             walk_speed=walk_speed)
+
+    log.info(
+        f"/shade-walk: {int(total_dist)}m, shade={metrics['shade_fraction']:.1%}, "
+        f"pts={len(path)}"
+    )
+
+    return {
+        "polyline":       polyline_str,
+        "distance_m":     int(total_dist),
+        "duration_s":     metrics["duration_s"],
+        "shade_fraction": round(metrics["shade_fraction"], 3),
+        "shade_map":      metrics.get("shade_map", ""),
+    }
+
+
+def _encode_polyline(coords: list[tuple[float, float]]) -> str:
+    """Кодирует список (lat, lon) в Google Encoded Polyline формат."""
+    result = []
+    prev_lat = prev_lon = 0
+    for lat, lon in coords:
+        for val, prev in [(lat, prev_lat), (lon, prev_lon)]:
+            delta = round(val * 1e5) - prev
+            val_enc = delta << 1 if delta >= 0 else ~(delta << 1)
+            while val_enc >= 0x20:
+                result.append(chr((0x20 | (val_enc & 0x1f)) + 63))
+                val_enc >>= 5
+            result.append(chr(val_enc + 63))
+        prev_lat = round(lat * 1e5)
+        prev_lon = round(lon * 1e5)
+    return "".join(result)
 
 
 @app.post("/routes", response_model=RoutesResponse)
