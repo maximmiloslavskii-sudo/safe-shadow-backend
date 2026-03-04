@@ -430,8 +430,9 @@ def analyse_route(points, buildings, sun_alt, sun_az, weather,
     total_m    = dist_acc
     duration_s = total_m / walk_speed
     shade_frac = shade_acc / total_pts   # непрерывный 0–1
-    shade_min  = duration_s * shade_frac / 60
-    sun_min    = duration_s * (1 - shade_frac) / 60
+    is_night   = sun_alt <= 1.0          # солнце под горизонтом
+    shade_min  = duration_s / 60 if is_night else duration_s * shade_frac / 60
+    sun_min    = 0.0        if is_night else duration_s * (1 - shade_frac) / 60
     avg_uv     = uv_total / total_pts
     avg_heat   = heat_total / total_pts
 
@@ -446,6 +447,7 @@ def analyse_route(points, buildings, sun_alt, sun_az, weather,
         "shade_fraction": shade_frac,
         "shade_min":      round(shade_min, 1),
         "sun_min":        round(sun_min,   1),
+        "is_night":       is_night,
         "uv_dose":        round(avg_uv * duration_s / 3600, 2),
         "heat_load":      round(avg_heat * duration_s / 3600, 2),
         "temp_feels_c":   round(avg_heat, 1),
