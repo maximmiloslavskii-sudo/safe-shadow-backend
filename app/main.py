@@ -97,27 +97,54 @@ async def _fetch_streets_cached(
     bbox: tuple[float, float, float, float],
     client: httpx.AsyncClient
 ) -> list:
-    """Возвращает сеть улиц из кэша (TTL 30 мин) или из Overpass API."""
+    """
+    Возвращает сеть улиц из кэша (TTL 30 мин) или из Overpass API.
+    При ошибке: 2 попытки (основной + зеркало), затем stale-кэш если есть.
+    """
     s, w, n, e = bbox
     key = f"{s:.3f},{w:.3f},{n:.3f},{e:.3f}"
     now = time.time()
-    if key in _streets_cache:
-        segs, ts = _streets_cache[key]
+
+    # Попытка вернуть свежий кэш
+    cached = _streets_cache.get(key)
+    if cached:
+        segs, ts = cached
         if now - ts < _STREETS_CACHE_TTL:
             log.info(f"Streets cache HIT ({len(segs)} segments)")
             return segs
-    try:
-        segs = await asyncio.wait_for(
-            fetch_street_network(s, w, n, e, client), timeout=28.0
-        )
-        _streets_cache[key] = (segs, now)
-        if len(_streets_cache) > 20:   # не даём кэшу разрастись
-            oldest = min(_streets_cache, key=lambda k: _streets_cache[k][1])
-            del _streets_cache[oldest]
+
+    # Пробуем 2 попытки: основной и резервный Overpass-зеркала
+    _OVERPASS_MIRRORS = [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+    ]
+    last_exc: Exception | None = None
+    for attempt, mirror_url in enumerate(_OVERPASS_MIRRORS):
+        try:
+            segs = await asyncio.wait_for(
+                fetch_street_network(s, w, n, e, client, overpass_url=mirror_url),
+                timeout=28.0,
+            )
+            if segs:
+                _streets_cache[key] = (segs, now)
+                if len(_streets_cache) > 20:
+                    oldest = min(_streets_cache, key=lambda k: _streets_cache[k][1])
+                    del _streets_cache[oldest]
+                log.info(f"Streets fetched via mirror #{attempt+1}: {len(segs)} segs")
+                return segs
+        except Exception as exc:
+            last_exc = exc
+            log.warning(f"Streets mirror #{attempt+1} failed: {exc}")
+
+    # Все зеркала недоступны — возвращаем устаревший кэш если есть
+    if cached:
+        segs, ts = cached
+        age_min = (now - ts) / 60
+        log.warning(f"All Overpass mirrors failed — using stale cache ({age_min:.0f} min old)")
         return segs
-    except asyncio.TimeoutError:
-        log.warning("Streets fetch timeout — пустой граф")
-        return []
+
+    log.warning(f"Streets unavailable, all mirrors failed: {last_exc}")
+    return []
 
 # ─── Модели ───────────────────────────────────────────────────────────────────
 
@@ -270,14 +297,15 @@ def _parse_depart(departure_time: Optional[str]) -> datetime:
 
 
 async def _analyse_batch(
-    raw_routes: list[dict],
-    buildings:  list,
-    sun_alt:    float,
-    sun_az:     float,
-    weather:    dict,
-    walk_speed: float,
-    depart_dt:  datetime,
-    loop:       asyncio.AbstractEventLoop
+    raw_routes:  list[dict],
+    buildings:   list,
+    sun_alt:     float,
+    sun_az:      float,
+    weather:     dict,
+    walk_speed:  float,
+    depart_dt:   datetime,
+    loop:        asyncio.AbstractEventLoop,
+    leaf_factor: float = 1.0,
 ) -> list[tuple[dict, dict]]:
     """Анализирует сырые маршруты, возвращает [(raw, stats), ...]."""
     result = []
@@ -286,13 +314,14 @@ async def _analyse_batch(
         stats = await loop.run_in_executor(
             _executor,
             partial(analyse_route,
-                points     = pts,
-                buildings  = buildings,
-                sun_alt    = sun_alt,
-                sun_az     = sun_az,
-                weather    = weather,
-                walk_speed = walk_speed,
-                depart_dt  = depart_dt,
+                points      = pts,
+                buildings   = buildings,
+                sun_alt     = sun_alt,
+                sun_az      = sun_az,
+                weather     = weather,
+                walk_speed  = walk_speed,
+                depart_dt   = depart_dt,
+                leaf_factor = leaf_factor,
             )
         )
         result.append((raw, stats))
@@ -375,7 +404,7 @@ async def debug_shade(req: dict):
         street_segs = await asyncio.wait_for(
             fetch_street_network(s, w, n, e, client), timeout=25.0
         )
-    leaf = _leaf_factor(depart_dt.month)
+    leaf = _leaf_factor(depart_dt.month, lat=olat)
     shadow_polys = build_shadow_polys(buildings, sun_alt, sun_az, leaf_factor=leaf)
 
     loop = asyncio.get_event_loop()
@@ -469,16 +498,16 @@ async def best_time(req: dict):
 @app.post("/shade-walk")
 async def shade_walk(req: dict):
     """
-    PRO: Генерирует круговой маршрут с максимальной тенью без конечной точки.
+    PRO: Генерирует топ-2 круговых маршрута с максимальной тенью без конечной точки.
 
     Вход:  { lat, lon, duration_min, transport }
-    Выход: { polyline, distance_m, duration_s, shade_fraction, shade_map }
+    Выход: { routes: [ { polyline, distance_m, duration_s, shade_fraction, shade_map }, ... ] }
 
     Алгоритм:
       1. Вычислить целевую дистанцию: speed × duration_min × 60
       2. Получить здания и сеть улиц из кэша
-      3. find_shade_loop() — Dijkstra по 8 кандидатным точкам вокруг origin
-      4. Проанализировать маршрут, вернуть метрики
+      3. find_shade_loop() — Dijkstra по 8 кандидатным точкам, топ-2 с разнообразием ≥90°
+      4. Проанализировать каждый маршрут, вернуть список
     """
     lat          = float(req["lat"])
     lon          = float(req["lon"])
@@ -489,9 +518,18 @@ async def shade_walk(req: dict):
     walk_speed  = 4.0 if transport == "bike" else 1.35   # м/с
     target_dist = walk_speed * duration_min * 60          # метры
 
-    # Загружаем данные (с кэшем)
-    pad    = max(0.015, target_dist / 111_000 * 1.5)
+    # Загружаем данные (с кэшем).
+    # Ограничиваем bbox ≤ 0.04° (≈4.5 км) чтобы не грузить >80k сегментов в плотных городах.
+    pad    = min(max(0.015, target_dist / 111_000 * 1.5), 0.04)
     bbox   = (lat - pad, lon - pad, lat + pad, lon + pad)
+
+    # Ограничиваем целевую дистанцию для Dijkstra физическим размером bbox.
+    # Вейпоинт ставится на target_dist/3 от начала → он должен лежать внутри bbox-радиуса.
+    # bbox_radius = pad × 111000 → max_target = bbox_radius × 2.8 (с небольшим запасом).
+    # Без этого при 300-мин запросах Dijkstra исследует весь граф с огромным бюджетом → 60s.
+    bbox_radius_m        = pad * 111_000
+    target_dist_dijkstra = min(target_dist, bbox_radius_m * 2.8)
+
     coords = [(lat, lon)]
 
     async with httpx.AsyncClient() as client:
@@ -502,17 +540,17 @@ async def shade_walk(req: dict):
 
     depart_dt = datetime.now(timezone.utc)
     sun_alt, sun_az = sun_position(lat, lon, depart_dt)
-    leaf        = _leaf_factor(depart_dt.month)
+    leaf        = _leaf_factor(depart_dt.month, lat=lat)
     sun_penalty = 8.0 if transport == "bike" else 20.0
     shadow_polys = build_shadow_polys(buildings, sun_alt, sun_az, leaf_factor=leaf)
 
-    loop = asyncio.get_event_loop()
-    loop_result = await loop.run_in_executor(
+    event_loop = asyncio.get_event_loop()
+    loop_results = await event_loop.run_in_executor(
         _executor,
         partial(
             find_shade_loop,
             lat, lon,
-            target_dist,
+            target_dist_dijkstra,
             street_segs,
             shadow_polys,
             buildings,
@@ -522,31 +560,40 @@ async def shade_walk(req: dict):
         )
     )
 
-    if loop_result is None:
+    if not loop_results:
         raise HTTPException(status_code=422, detail="Не удалось построить круговой маршрут")
 
-    path, total_dist = loop_result
+    weather = {"uv_index": 3.0, "cloud_cover": 30.0, "temp_c": 25.0}
+    routes = []
+    for loop_item in loop_results:
+        path       = loop_item["path"]
+        total_dist = loop_item["dist"]
 
-    # Кодируем полилинию
-    polyline_str = _encode_polyline(path)
+        polyline_str = _encode_polyline(path)
+        metrics = analyse_route(path, buildings, sun_alt, sun_az, weather,
+                                walk_speed=walk_speed, depart_dt=depart_dt, leaf_factor=leaf)
 
-    # Анализируем маршрут
-    weather  = {"uv_index": 3.0, "cloud_cover": 30.0, "temp_c": 25.0}
-    metrics  = analyse_route(path, buildings, sun_alt, sun_az, weather,
-                             walk_speed=walk_speed)
+        log.info(
+            f"/shade-walk route: {int(total_dist)}m, shade={metrics['shade_fraction']:.1%}, "
+            f"bearing={loop_item['bearing']}, pts={len(path)}"
+        )
 
-    log.info(
-        f"/shade-walk: {int(total_dist)}m, shade={metrics['shade_fraction']:.1%}, "
-        f"pts={len(path)}"
-    )
+        # Используем shade_fraction из Dijkstra-оптимизации (find_shade_loop),
+        # если analyse_route вернул 0 (ночь или нет данных о зданиях).
+        # Dijkstra-оценка рассчитана на основе физических параметров здания и
+        # ориентации улиц, она точнее отражает ожидаемую тень маршрута.
+        loop_sf   = loop_item.get("shade_fraction", 0.0)
+        report_sf = metrics["shade_fraction"] if metrics["shade_fraction"] > 0.0 else loop_sf
 
-    return {
-        "polyline":       polyline_str,
-        "distance_m":     int(total_dist),
-        "duration_s":     metrics["duration_s"],
-        "shade_fraction": round(metrics["shade_fraction"], 3),
-        "shade_map":      metrics.get("shade_map", ""),
-    }
+        routes.append({
+            "polyline":       polyline_str,
+            "distance_m":     int(total_dist),
+            "duration_s":     metrics["duration_s"],
+            "shade_fraction": round(report_sf, 3),
+            "shade_map":      metrics.get("shade_map", ""),
+        })
+
+    return {"routes": routes}
 
 
 def _encode_polyline(coords: list[tuple[float, float]]) -> str:
@@ -596,8 +643,8 @@ async def routes(req: RoutesRequest):
         )
     log.info(f"Buildings: {len(buildings)} | Street segs: {len(street_segs)}")
 
-    # Сезонный коэффициент листвы деревьев (0.15 зима → 1.0 лето)
-    leaf = _leaf_factor(depart_dt.month)
+    # Сезонный коэффициент листвы деревьев (0.15 зима → 1.0 лето, с учётом полушария)
+    leaf = _leaf_factor(depart_dt.month, lat=req.origin.lat)
 
     # Строим теневые полигоны ОДИН РАЗ — используются везде
     shadow_polys = build_shadow_polys(buildings, sun_alt, sun_az, leaf_factor=leaf)
@@ -607,7 +654,7 @@ async def routes(req: RoutesRequest):
     # ── 3. Анализ OSRM маршрутов ─────────────────────────────────────────────
     analyzed = await _analyse_batch(
         raw_routes, buildings, sun_alt, sun_az, weather,
-        req.walk_speed_mps, depart_dt, loop
+        req.walk_speed_mps, depart_dt, loop, leaf_factor=leaf,
     )
     log.info(f"Analysed {len(analyzed)} OSRM routes")
 
@@ -648,13 +695,14 @@ async def routes(req: RoutesRequest):
         shade_stats = await loop.run_in_executor(
             _executor,
             partial(analyse_route,
-                points     = pts,
-                buildings  = buildings,
-                sun_alt    = sun_alt,
-                sun_az     = sun_az,
-                weather    = weather,
-                walk_speed = req.walk_speed_mps,
-                depart_dt  = depart_dt,
+                points      = pts,
+                buildings   = buildings,
+                sun_alt     = sun_alt,
+                sun_az      = sun_az,
+                weather     = weather,
+                walk_speed  = req.walk_speed_mps,
+                depart_dt   = depart_dt,
+                leaf_factor = leaf,
             )
         )
         shade_graph_analyzed = (shade_raw, shade_stats)

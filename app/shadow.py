@@ -21,7 +21,7 @@ import itertools
 import math
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from heapq import heappush, heappop
 from typing import Optional
 
@@ -37,10 +37,13 @@ log = logging.getLogger(__name__)
 # ─── Константы ────────────────────────────────────────────────────────────────
 SAMPLE_STEP_M    = 40       # шаг дискретизации (метров) — увеличен для скорости
 BUILDING_RADIUS  = 80       # радиус поиска зданий (метров)
-SIDE_OFFSET_M    = 4.0      # смещение для проверки стороны улицы
+SIDE_OFFSET_M    = 1.5      # смещение для проверки стороны улицы (≈ позиция пешехода у стены)
 DEFAULT_HEIGHT   = 10.0
-FLOORS_DEFAULT   = 3
+FLOORS_DEFAULT   = 5        # типичная многоэтажка в плотной застройке (BA, LATAM)
 FLOOR_HEIGHT     = 3.2
+SHADOW_LEN_CAP_M = 500      # макс. длина тени (м) — увеличен для низкого солнца
+SUN_RECALC_INTERVAL_S = 300 # пересчёт позиции солнца каждые 5 мин ходьбы
+MAX_TREES        = 400       # макс. деревьев — берём ближайшие к маршруту
 
 # ─── Координатные утилиты ─────────────────────────────────────────────────────
 
@@ -103,7 +106,7 @@ def shadow_polygon(footprint: Polygon, height_m: float,
     if sun_alt_deg <= 1.0:
         return None
 
-    shadow_len_m = min(height_m / math.tan(_deg2rad(sun_alt_deg)), 300)
+    shadow_len_m = min(height_m / math.tan(_deg2rad(sun_alt_deg)), SHADOW_LEN_CAP_M)
     shadow_dir   = (sun_az_deg + 180) % 360
     dx = math.sin(_deg2rad(shadow_dir))
     dy = math.cos(_deg2rad(shadow_dir))
@@ -210,7 +213,7 @@ async def fetch_buildings(coords, client: httpx.AsyncClient) -> list[dict]:
         r.raise_for_status()
         elements = r.json().get("elements", [])
         objects: list[dict] = []
-        tree_count = 0
+        pending_trees: list[dict] = []   # все деревья до сортировки
 
         for el in elements:
             tags    = el.get("tags", {})
@@ -232,16 +235,16 @@ async def fetch_buildings(coords, client: httpx.AsyncClient) -> list[dict]:
                             pass
 
             elif tags.get("natural") == "tree" and el_type == "node":
-                if tree_count >= 400:
-                    continue
                 lat_t = el.get("lat")
                 lon_t = el.get("lon")
                 if lat_t is not None and lon_t is not None:
                     h, r = _tree_height_radius(tags)
                     poly = _circle_polygon(lat_t, lon_t, r)
                     if poly:
-                        objects.append({"polygon": poly, "height": h, "type": "tree"})
-                        tree_count += 1
+                        pending_trees.append({
+                            "polygon": poly, "height": h, "type": "tree",
+                            "_lat": lat_t, "_lon": lon_t,
+                        })
 
             elif (tags.get("natural") in ("wood", "tree_row") or
                   tags.get("landuse") == "forest"):
@@ -258,6 +261,16 @@ async def fetch_buildings(coords, client: httpx.AsyncClient) -> list[dict]:
                                 })
                         except Exception:
                             pass
+
+        # Сортируем деревья по расстоянию до центра маршрута, берём MAX_TREES ближайших
+        if pending_trees:
+            route_lat = sum(c[0] for c in coords) / len(coords)
+            route_lon = sum(c[1] for c in coords) / len(coords)
+            pending_trees.sort(
+                key=lambda t: haversine_m(t["_lat"], t["_lon"], route_lat, route_lon)
+            )
+            for t in pending_trees[:MAX_TREES]:
+                objects.append({"polygon": t["polygon"], "height": t["height"], "type": "tree"})
 
         log.info(f"Shadow objects: buildings={sum(1 for o in objects if o['type']=='building')}, "
                  f"trees={sum(1 for o in objects if o['type']=='tree')}, "
@@ -322,7 +335,7 @@ def build_shadow_polys(
 # ─── Основной анализ маршрута (оптимизирован через STRtree) ──────────────────
 
 def analyse_route(points, buildings, sun_alt, sun_az, weather,
-                  walk_speed=1.35, depart_dt=None):
+                  walk_speed=1.35, depart_dt=None, leaf_factor=1.0):
     """
     Анализирует маршрут и возвращает метрики тени.
 
@@ -331,7 +344,8 @@ def analyse_route(points, buildings, sun_alt, sun_az, weather,
     у маршрута «Теневой» реально отражает то, что он оптимизировал.
 
     Физические переменные:
-      - Астрономические:  sun_alt, sun_az (из ephem)
+      - Астрономические:  sun_alt, sun_az (из ephem) — пересчитываются каждые
+                          SUN_RECALC_INTERVAL_S секунд ходьбы для длинных маршрутов
       - Геометрия:        H (высота зданий), W (ширина улицы), H/W ratio
       - SVF:              Sky View Factor = W / √(W²+H²)
       - shadow_len:       H / tan(sun_alt)   — длина тени
@@ -341,7 +355,15 @@ def analyse_route(points, buildings, sun_alt, sun_az, weather,
     if depart_dt is None:
         depart_dt = datetime.now(timezone.utc)
 
-    shadow_polys = build_shadow_polys(buildings, sun_alt, sun_az)
+    # Текущая позиция солнца (будет обновляться по ходу маршрута)
+    cur_sun_alt = sun_alt
+    cur_sun_az  = sun_az
+    last_sun_recalc_s = 0.0
+    # Опорная точка для пересчёта: первая точка маршрута
+    ref_lat = points[0][0] if points else 0.0
+    ref_lon = points[0][1] if points else 0.0
+
+    shadow_polys = build_shadow_polys(buildings, cur_sun_alt, cur_sun_az, leaf_factor=leaf_factor)
     poly_tree    = STRtree(shadow_polys) if shadow_polys else None
 
     # Пространственный индекс зданий — для физической модели тени
@@ -361,6 +383,17 @@ def analyse_route(points, buildings, sun_alt, sun_az, weather,
 
     for i, (lat, lon) in enumerate(points):
         n_pts += 1
+
+        # ── Динамический пересчёт позиции солнца каждые 5 мин ходьбы ────────
+        elapsed_s = dist_acc / max(walk_speed, 0.1)
+        if elapsed_s - last_sun_recalc_s >= SUN_RECALC_INTERVAL_S and i > 0:
+            recalc_dt   = depart_dt + timedelta(seconds=elapsed_s)
+            cur_sun_alt, cur_sun_az = sun_position(ref_lat, ref_lon, recalc_dt)
+            last_sun_recalc_s = elapsed_s
+            # Перестраиваем полигоны теней с новым положением солнца
+            shadow_polys = build_shadow_polys(buildings, cur_sun_alt, cur_sun_az, leaf_factor=leaf_factor)
+            poly_tree    = STRtree(shadow_polys) if shadow_polys else None
+            log.debug(f"Sun recalc at {elapsed_s:.0f}s: alt={cur_sun_alt:.1f}° az={cur_sun_az:.1f}°")
 
         # ── Направление улицы в этой точке ──────────────────────────────────
         if i < len(points) - 1:
@@ -383,8 +416,8 @@ def analyse_route(points, buildings, sun_alt, sun_az, weather,
         phys_shade = _point_physics_shade(
             lat, lon, seg_b,
             bld_index_tuple, bld_heights,
-            sun_alt, sun_az,
-        ) if sun_alt > 1.0 else 0.0
+            cur_sun_alt, cur_sun_az,
+        ) if cur_sun_alt > 1.0 else 0.0
 
         # Итоговая тень: полигоны точны → полный вес; физика 90%
         shade_score = max(poly_shade, phys_shade * 0.90)
@@ -430,7 +463,7 @@ def analyse_route(points, buildings, sun_alt, sun_az, weather,
     total_m    = dist_acc
     duration_s = total_m / walk_speed
     shade_frac = shade_acc / total_pts   # непрерывный 0–1
-    is_night   = sun_alt <= 1.0          # солнце под горизонтом
+    is_night   = sun_alt <= 1.0 and cur_sun_alt <= 1.0  # солнце под горизонтом
     shade_min  = duration_s / 60 if is_night else duration_s * shade_frac / 60
     sun_min    = 0.0        if is_night else duration_s * (1 - shade_frac) / 60
     avg_uv     = uv_total / total_pts
@@ -462,7 +495,8 @@ def analyse_route(points, buildings, sun_alt, sun_az, weather,
 
 async def fetch_street_network(
     s: float, w: float, n: float, e: float,
-    client: httpx.AsyncClient
+    client: httpx.AsyncClient,
+    overpass_url: str = "https://overpass-api.de/api/interpreter",
 ) -> list[tuple[float, float, float, float]]:
     """
     Загружает пешеходную сеть улиц в bbox (s, w, n, e) из Overpass.
@@ -472,14 +506,13 @@ async def fetch_street_network(
     парковые дорожки, сервисные проезды и т.д.
     Исключает: автомагистрали, строящиеся/предложенные/заброшенные дороги.
     """
-    # Только пешеходные/жилые типы (не все highway)
     query = f"""[out:json][timeout:25];
 way["highway"~"footway|path|pedestrian|living_street|residential|service|track|steps|unclassified|tertiary|secondary|primary"]
    ({s:.5f},{w:.5f},{n:.5f},{e:.5f});
 out body geom;"""
     try:
         r = await client.post(
-            "https://overpass-api.de/api/interpreter",
+            overpass_url,
             data={"data": query},
             timeout=28,
         )
@@ -509,7 +542,11 @@ def _build_building_index(buildings: list):
     lats, lons, heights = [], [], []
     for b in buildings:
         try:
-            c = b["polygon"].centroid
+            poly = b["polygon"]
+            raw_pt = poly.centroid
+            # Для Г/П/U-образных зданий centroid может лежать вне полигона —
+            # используем representative_point(), который гарантированно внутри
+            c = raw_pt if poly.contains(raw_pt) else poly.representative_point()
             lats.append(c.y)
             lons.append(c.x)
             heights.append(b["height"])
@@ -550,18 +587,19 @@ def _build_building_index(buildings: list):
 #   2. Физика урбан-каньона (cKDTree): везде, масштабируется с ориентацией улицы
 # Итог: максимум из обоих + непрерывная шкала 0.0–1.0
 
-def _leaf_factor(month: int) -> float:
+def _leaf_factor(month: int, lat: float = 0.0) -> float:
     """
     Сезонный коэффициент листвы деревьев (0.15 зима → 1.0 лето).
 
-    Деревья в декабре–январе почти не дают тени (голые ветки);
-    в июне–августе — полная листва.
+    Учитывает полушарие: в Южном (lat < 0) сезоны противоположны.
+      - Северное (BA — НЕТ): пик в июле  (month 7)
+      - Южное   (BA — ДА):  пик в январе (month 1)
 
-    Модель: сдвинутый косинус с пиком в июле (месяц 7).
-    Диапазон: 0.15 (январь) … 1.0 (июль).
+    Диапазон: 0.15 (местная зима) … 1.0 (местное лето).
     """
-    angle = 2 * math.pi * (month - 7) / 12   # 0 рад в июле, ±π в январе
-    raw   = (1.0 + math.cos(angle)) / 2.0    # 1.0 в июле, 0.0 в январе
+    peak_month = 1 if lat < 0 else 7         # январь для южного полушария
+    angle = 2 * math.pi * (month - peak_month) / 12
+    raw   = (1.0 + math.cos(angle)) / 2.0
     return 0.15 + 0.85 * raw
 
 
@@ -751,21 +789,25 @@ def find_shade_loop(
     sun_alt: float,
     sun_az: float,
     sun_penalty: float = 20.0,
-) -> Optional[tuple[list[tuple[float, float]], float]]:
+    max_routes: int = 2,
+) -> list[dict]:
     """
-    Строит круговой маршрут (петлю) с максимальной долей тени.
+    Строит топ-N круговых маршрутов (петель) с максимальной долей тени.
 
     Алгоритм:
     1. Генерируем 8 кандидат-точек вокруг origin (N, NE, E, … NW)
        на расстоянии target_dist_m / 3 от origin.
-    2. Для каждой: Dijkstra origin → waypoint (тень-оптимизация).
-    3. Выбираем waypoint с наибольшей долей тени.
-    4. Замыкаем петлю: origin → best_wp → origin.
+    2. Для каждой: Dijkstra origin → waypoint → origin (тень-оптимизация).
+    3. Сортируем все рабочие петли по доле тени (убывание).
+    4. Фильтр разнообразия: 2-й и далее маршруты должны иметь
+       ≥90° разницы по азимуту с уже выбранными.
 
-    Возвращает ([(lat, lon), ...], total_dist_m) или None.
+    Возвращает список dict:
+      [{"path": [(lat,lon),...], "dist": float, "shade_fraction": float}, ...]
+    или [] если ничего не построено.
     """
     if not street_segs:
-        return None
+        return []
 
     poly_tree: Optional[STRtree] = STRtree(shadow_polys) if shadow_polys else None
     bld_index_tuple, _, _, bld_heights = _build_building_index(buildings)
@@ -777,9 +819,13 @@ def find_shade_loop(
     def _nid(lat: float, lon: float) -> tuple:
         return (round(lat, PREC), round(lon, PREC))
 
+    # Минимальная длина сегмента — отсекаем микро-сегменты перекрёстков
+    # (в Москве ~40-60% сегментов <3м). Это сохраняет связность графа.
+    MIN_SEG_M = 3.0
+
     for la1, lo1, la2, lo2 in street_segs:
         d_m = haversine_m(la1, lo1, la2, lo2)
-        if d_m < 0.5:
+        if d_m < MIN_SEG_M:
             continue
         n1, n2 = _nid(la1, lo1), _nid(la2, lo2)
         node_coords[n1] = (la1, lo1)
@@ -791,7 +837,7 @@ def find_shade_loop(
         adj.setdefault(n2, []).append((n1, d_m, cost))
 
     if not adj:
-        return None
+        return []
 
     all_nodes = list(adj.keys())
     node_arr  = np.array([(node_coords[n][0], node_coords[n][1]) for n in all_nodes])
@@ -839,8 +885,12 @@ def find_shade_loop(
         return path, g_dist.get(dst, 0.0), g_shade.get(dst, 0.0)
 
     start    = _nearest(origin_lat, origin_lon)
-    deadline = time.monotonic() + 22.0
-    half_budget = target_dist_m * 0.7   # чуть больше половины — достаточно для петли
+    deadline = time.monotonic() + 25.0
+    # Бюджет на каждый отрезок петли (origin→wp и wp→origin).
+    # 1.2× target_dist даёт Dijkstra достаточно свободы для разных планировок улиц.
+    # Ограничиваем 8000м чтобы длинные прогулки (300 мин, bbox 4.4 км) не
+    # исследовали весь граф с огромным бюджетом — иначе ~60с вместо 20с.
+    half_budget = min(target_dist_m * 1.2, 8_000.0)
 
     # 8 кандидат-точек на расстоянии ~1/3 target вокруг origin
     wp_dist = target_dist_m / 3.0
@@ -849,12 +899,11 @@ def find_shade_loop(
         wp_lat, wp_lon = offset_point(origin_lat, origin_lon, wp_dist, bearing)
         wp_node = _nearest(wp_lat, wp_lon)
         if wp_node != start:
-            candidates.append(wp_node)
+            candidates.append((bearing, wp_node))
 
-    best_loop: Optional[tuple] = None
-    best_shade_frac = -1.0
+    all_loops: list[dict] = []
 
-    for wp in candidates:
+    for bearing, wp in candidates:
         if time.monotonic() > deadline:
             break
         r1 = _dijkstra(start, wp, half_budget, deadline)
@@ -868,18 +917,55 @@ def find_shade_loop(
         total_dist  = d1 + d2
         total_shade = shd1 + shd2
         sf = total_shade / max(total_dist, 1.0)
-        if sf > best_shade_frac:
-            best_shade_frac = sf
-            best_loop       = (path1 + path2[1:], total_dist)
-        log.info(f"Loop candidate bearing={bearing if bearing else '?'}: "
-                 f"dist={int(total_dist)}m shade={sf:.1%}")
+        all_loops.append({
+            "bearing": bearing,
+            "path": path1 + path2[1:],
+            "dist": total_dist,
+            "shade_fraction": sf,
+        })
+        log.info(f"Loop candidate bearing={bearing}: dist={int(total_dist)}m shade={sf:.1%}")
 
-    if best_loop is None:
+    if not all_loops:
         log.warning("find_shade_loop: no loop found")
-        return None
+        return []
 
-    log.info(f"Best loop: {int(best_loop[1])}m shade={best_shade_frac:.1%}")
-    return best_loop
+    # Сортируем по доле тени (лучшие первыми)
+    all_loops.sort(key=lambda x: x["shade_fraction"], reverse=True)
+
+    # Фильтр разнообразия: ≥90° разницы по азимуту между выбранными маршрутами
+    result: list[dict] = []
+    chosen_bearings: list[float] = []
+    for loop in all_loops:
+        if not chosen_bearings:
+            result.append(loop)
+            chosen_bearings.append(loop["bearing"])
+        else:
+            # Для каждого уже выбранного маршрута вычисляем симметричный угол
+            # (min из двух направлений), затем берём минимум по всем
+            min_diff = min(
+                min(abs(loop["bearing"] - b) % 360,
+                    360 - abs(loop["bearing"] - b) % 360)
+                for b in chosen_bearings
+            )
+            if min_diff >= 90:
+                result.append(loop)
+                chosen_bearings.append(loop["bearing"])
+        if len(result) >= max_routes:
+            break
+
+    # Если разнообразных маршрутов не хватило, добираем без фильтра
+    if len(result) < max_routes and len(all_loops) > len(result):
+        for loop in all_loops:
+            if loop not in result:
+                result.append(loop)
+            if len(result) >= max_routes:
+                break
+
+    for i, r in enumerate(result):
+        log.info(f"Result route #{i+1}: bearing={r['bearing']} "
+                 f"dist={int(r['dist'])}m shade={r['shade_fraction']:.1%}")
+
+    return result
 
 
 def find_shade_route(
@@ -1069,12 +1155,14 @@ def find_shade_route(
                 offset_point(mid_lat, mid_lon, displace, (direct_bear + 90)  % 360),
                 offset_point(mid_lat, mid_lon, displace, (direct_bear - 90 + 360) % 360),
             ]
-            # Выбираем кандидата ближе к теневой стороне от солнца
+            # Выбираем кандидата ближе к теневой стороне от солнца.
+            # Используем _point_physics_shade (физическая оценка тени в точке).
             best_wp = max(
                 wp_candidates,
                 key=lambda wp: _shade_at_pt(wp[0], wp[1], shadow_polys, poly_tree)
-                               + _urban_canyon_shade_fast(
-                                   wp[0] - 0.0001, wp[1], wp[0] + 0.0001, wp[1],
+                               + _point_physics_shade(
+                                   wp[0], wp[1],
+                                   direct_bear,          # ориентация улицы ≈ прямое направление
                                    bld_index_tuple, bld_heights, sun_alt, sun_az
                                )
             )
