@@ -779,6 +779,56 @@ def _edge_shade_score(
     )
 
 
+# ─── Безопасность улиц ────────────────────────────────────────────────────────
+
+def _build_safety_index(danger_zones: list):
+    """
+    Строит (STRtree, polys_list, risk_levels) для O(log N) point-in-polygon тестов.
+
+    danger_zones: [(coords_list, risk_level), ...]
+      coords_list — список (lat, lon) замкнутого полигона
+      risk_level  — 1..3 (1=осторожно, 2=опасно, 3=избегать)
+
+    STRtree позволяет сначала быстро отфильтровать кандидатов по bbox,
+    а уже потом делать точный contains — вместо перебора всех N полигонов
+    для каждого из 175k сегментов (было: O(175k×N), стало: O(175k×log N)).
+    """
+    polys: list = []
+    risks: list = []
+    for coords, risk_level in danger_zones:
+        if len(coords) < 3:
+            continue
+        try:
+            poly = Polygon([(lo, la) for la, lo in coords])  # shapely: (lon, lat)
+            if poly.is_valid and not poly.is_empty:
+                polys.append(poly)
+                risks.append(float(risk_level))
+        except Exception:
+            pass
+    if not polys:
+        return None, [], []
+    return STRtree(polys), polys, risks
+
+
+def _safety_for_seg(la1: float, lo1: float, la2: float, lo2: float,
+                    safety_tree, safety_polys: list, safety_risks: list) -> float:
+    """
+    Возвращает коэффициент безопасности сегмента: 1.0 = безопасно, < 1.0 = риск.
+
+    Использует STRtree для O(log N) фильтрации по bbox, затем точный contains.
+    - risk_level=1 → score=0.50 (умеренный риск, промзона)
+    - risk_level=2 → score=0.33 (высокий риск)
+    - risk_level=3 → score=0.20 (очень высокий, неформальное поселение)
+    """
+    if safety_tree is None:
+        return 1.0
+    pt = Point((lo1 + lo2) / 2.0, (la1 + la2) / 2.0)
+    for idx in safety_tree.query(pt):
+        if safety_polys[idx].contains(pt):
+            return 1.0 / (1.0 + safety_risks[idx])
+    return 1.0
+
+
 def find_shade_loop(
     origin_lat: float,
     origin_lon: float,
@@ -790,6 +840,7 @@ def find_shade_loop(
     sun_az: float,
     sun_penalty: float = 20.0,
     max_routes: int = 2,
+    danger_zones: Optional[list] = None,
 ) -> list[dict]:
     """
     Строит топ-N круговых маршрутов (петель) с максимальной долей тени.
@@ -812,6 +863,18 @@ def find_shade_loop(
     poly_tree: Optional[STRtree] = STRtree(shadow_polys) if shadow_polys else None
     bld_index_tuple, _, _, bld_heights = _build_building_index(buildings)
 
+    # Строим STRtree-индекс безопасности: O(log N) вместо O(N) на сегмент
+    # _build_safety_index возвращает (STRtree, polys_list, risks_list)
+    if danger_zones:
+        safety_tree, safety_polys, safety_risks = _build_safety_index(danger_zones)
+    else:
+        safety_tree, safety_polys, safety_risks = None, [], []
+    has_safety = safety_tree is not None
+
+    # Штраф за опасный район: при risk=3 (score=0.25) сегмент обходится в
+    # d_m × (1 + 40 × 0.75) = d_m × 31 → роутер активно их избегает.
+    SAFETY_PENALTY = 40.0
+
     PREC = 5
     adj: dict[tuple, list] = {}
     node_coords: dict[tuple, tuple] = {}
@@ -823,6 +886,50 @@ def find_shade_loop(
     # (в Москве ~40-60% сегментов <3м). Это сохраняет связность графа.
     MIN_SEG_M = 3.0
 
+    # ── Предвычисление сетки безопасности ─────────────────────────────────────
+    # Вместо point-in-polygon для каждого из 50k сегментов строим грубую сетку
+    # 100×100м: для каждого из N_zones полигонов проверяем ячейки в его bbox.
+    # Lookup на сегмент — O(1) по индексу ячейки.
+    # При bbox 0.04° ≈ 4400м и шаге 0.001° ≈ 111м → сетка 40×40 = 1600 ячеек.
+    GRID_DEG = 0.001   # ~111м на экваторе
+    safety_grid: Optional[np.ndarray] = None
+    grid_s = grid_w = 0.0
+    grid_nrow = grid_ncol = 0
+
+    if has_safety and street_segs:
+        # Определяем bbox по сегментам
+        all_la = [c for seg in street_segs for c in (seg[0], seg[2])]
+        all_lo = [c for seg in street_segs for c in (seg[1], seg[3])]
+        grid_s, grid_n = min(all_la), max(all_la)
+        grid_w, grid_e = min(all_lo), max(all_lo)
+        grid_nrow = max(1, int((grid_n - grid_s) / GRID_DEG) + 1)
+        grid_ncol = max(1, int((grid_e - grid_w) / GRID_DEG) + 1)
+        safety_grid = np.ones((grid_nrow, grid_ncol), dtype=np.float32)
+
+        for poly, risk in zip(safety_polys, safety_risks):
+            score = float(1.0 / (1.0 + risk))
+            bnd = poly.bounds  # (lon_min, lat_min, lon_max, lat_max)
+            r0 = max(0, int((bnd[1] - grid_s) / GRID_DEG))
+            r1 = min(grid_nrow - 1, int((bnd[3] - grid_s) / GRID_DEG))
+            c0 = max(0, int((bnd[0] - grid_w) / GRID_DEG))
+            c1 = min(grid_ncol - 1, int((bnd[2] - grid_w) / GRID_DEG))
+            for r in range(r0, r1 + 1):
+                cell_lat = grid_s + (r + 0.5) * GRID_DEG
+                for c in range(c0, c1 + 1):
+                    cell_lon = grid_w + (c + 0.5) * GRID_DEG
+                    if poly.contains(Point(cell_lon, cell_lat)):
+                        if score < safety_grid[r, c]:
+                            safety_grid[r, c] = score
+
+    def _grid_safety(mid_lat: float, mid_lon: float) -> float:
+        """O(1) lookup в предвычисленной сетке безопасности."""
+        if safety_grid is None:
+            return 1.0
+        r = min(grid_nrow - 1, max(0, int((mid_lat - grid_s) / GRID_DEG)))
+        c = min(grid_ncol - 1, max(0, int((mid_lon - grid_w) / GRID_DEG)))
+        return float(safety_grid[r, c])
+
+    # ── Строим граф ────────────────────────────────────────────────────────────
     for la1, lo1, la2, lo2 in street_segs:
         d_m = haversine_m(la1, lo1, la2, lo2)
         if d_m < MIN_SEG_M:
@@ -830,9 +937,12 @@ def find_shade_loop(
         n1, n2 = _nid(la1, lo1), _nid(la2, lo2)
         node_coords[n1] = (la1, lo1)
         node_coords[n2] = (la2, lo2)
-        shade = _edge_shade_score(la1, lo1, la2, lo2, shadow_polys, poly_tree,
-                                  bld_index_tuple, bld_heights, sun_alt, sun_az)
-        cost = d_m * (1.0 + sun_penalty * (1.0 - shade))
+        shade  = _edge_shade_score(la1, lo1, la2, lo2, shadow_polys, poly_tree,
+                                   bld_index_tuple, bld_heights, sun_alt, sun_az)
+        safety = _grid_safety((la1 + la2) / 2, (lo1 + lo2) / 2)
+        # Полностью безопасный теневой маршрут: cost = d_m × 1.0
+        # Опасный солнечный: cost = d_m × (1 + sun_penalty + safety_penalty)
+        cost = d_m * (1.0 + sun_penalty * (1.0 - shade) + SAFETY_PENALTY * (1.0 - safety))
         adj.setdefault(n1, []).append((n2, d_m, cost))
         adj.setdefault(n2, []).append((n1, d_m, cost))
 
@@ -914,16 +1024,35 @@ def find_shade_loop(
         if r2 is None:
             continue
         path2, d2, shd2 = r2
+        full_path   = path1 + path2[1:]
         total_dist  = d1 + d2
         total_shade = shd1 + shd2
         sf = total_shade / max(total_dist, 1.0)
+
+        # Вычисляем safety_score: доля маршрута (по дистанции) в безопасных зонах
+        # Используем ту же сетку — O(1) на сегмент
+        if has_safety:
+            safe_dist = 0.0
+            for i in range(len(full_path) - 1):
+                la1_, lo1_ = full_path[i]
+                la2_, lo2_ = full_path[i + 1]
+                seg_d = haversine_m(la1_, lo1_, la2_, lo2_)
+                safe_dist += seg_d * _grid_safety((la1_ + la2_) / 2, (lo1_ + lo2_) / 2)
+            route_safety = safe_dist / max(total_dist, 1.0)
+        else:
+            route_safety = 1.0
+
         all_loops.append({
-            "bearing": bearing,
-            "path": path1 + path2[1:],
-            "dist": total_dist,
+            "bearing":        bearing,
+            "path":           full_path,
+            "dist":           total_dist,
             "shade_fraction": sf,
+            "safety_score":   round(route_safety, 3),
         })
-        log.info(f"Loop candidate bearing={bearing}: dist={int(total_dist)}m shade={sf:.1%}")
+        log.info(
+            f"Loop candidate bearing={bearing}: dist={int(total_dist)}m "
+            f"shade={sf:.1%} safety={route_safety:.1%}"
+        )
 
     if not all_loops:
         log.warning("find_shade_loop: no loop found")

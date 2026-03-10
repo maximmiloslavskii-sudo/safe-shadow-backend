@@ -65,6 +65,11 @@ _BUILDINGS_CACHE_TTL = 600
 _streets_cache: dict = {}
 _STREETS_CACHE_TTL = 1800  # 30 минут
 
+# ─── Кэш зон опасности (TTL 60 минут) ─────────────────────────────────────────
+# Неформальные поселения/промзоны меняются редко → длинный кэш.
+_danger_cache: dict = {}
+_DANGER_CACHE_TTL = 3600  # 60 минут
+
 def _cache_key(coords: list) -> str:
     if not coords:
         return ""
@@ -145,6 +150,108 @@ async def _fetch_streets_cached(
 
     log.warning(f"Streets unavailable, all mirrors failed: {last_exc}")
     return []
+
+async def _do_fetch_danger_zones(key: str, bbox: tuple) -> list:
+    """
+    Реальный фетч зон опасности из Overpass (внутренняя функция).
+    Вызывается как fire-and-forget фоновая задача или напрямую при cache HIT.
+
+    Источники данных (прямые и косвенные признаки риска для пешехода):
+    ─ ПРЯМЫЕ (явные OSM-теги):
+      • landuse=informal_settlement — неформальные поселения (вильи, фавелы, slums, townships)
+      • informal=yes — альтернативный тег тех же объектов
+      • residential=informal_settlement
+    ─ КОСВЕННЫЕ (среда повышенного риска):
+      • landuse=industrial — промзоны (мало пешеходов, плохое освещение, нет торговли)
+      • landuse=brownfield — заброшенные территории
+      • landuse=military  — военные объекты
+
+    risk_level: 3=высокий (informal), 2=средний (brownfield/military), 1=низкий (industrial)
+    """
+    s, w, n, e = bbox
+    query = f"""
+[out:json][timeout:15];
+(
+  way["landuse"="informal_settlement"]({s},{w},{n},{e});
+  relation["landuse"="informal_settlement"]({s},{w},{n},{e});
+  way["informal"="yes"]({s},{w},{n},{e});
+  way["residential"="informal_settlement"]({s},{w},{n},{e});
+  way["landuse"="brownfield"]({s},{w},{n},{e});
+  way["landuse"="industrial"]({s},{w},{n},{e});
+  way["landuse"="military"]({s},{w},{n},{e});
+);
+out geom;
+"""
+    zones: list = []
+    for mirror in ("https://overpass-api.de/api/interpreter",
+                   "https://overpass.kumi.systems/api/interpreter"):
+        try:
+            async with httpx.AsyncClient() as cl:
+                resp = await asyncio.wait_for(
+                    cl.post(mirror, data={"data": query}, timeout=16.0),
+                    timeout=18.0,
+                )
+            data = resp.json()
+            for elem in data.get("elements", []):
+                if elem.get("type") != "way":
+                    continue
+                geom = elem.get("geometry", [])
+                if len(geom) < 3:
+                    continue
+                coords = [(pt["lat"], pt["lon"]) for pt in geom]
+                tags   = elem.get("tags", {})
+                lu     = tags.get("landuse", "")
+                info   = tags.get("informal", "")
+                res    = tags.get("residential", "")
+                if lu == "informal_settlement" or info == "yes" or res == "informal_settlement":
+                    risk = 3
+                elif lu in ("brownfield", "military"):
+                    risk = 2
+                else:
+                    risk = 1
+                zones.append((coords, risk))
+            break   # успешный ответ — выходим из цикла зеркал
+        except Exception as exc:
+            log.warning(f"Danger zones mirror {mirror} failed: {exc}")
+
+    now = time.time()
+    _danger_cache[key] = (zones, now)
+    if len(_danger_cache) > 30:
+        oldest = min(_danger_cache, key=lambda k: _danger_cache[k][1])
+        del _danger_cache[oldest]
+    log.info(f"Danger zones fetched: {len(zones)} zones (key={key})")
+    return zones
+
+
+def _get_danger_zones_nowait(bbox: tuple) -> list:
+    """
+    Возвращает зоны опасности из кэша НЕМЕДЛЕННО (не ждёт Overpass).
+
+    Если кэш свежий — возвращает данные.
+    Если кэша нет / устарел — запускает фоновый фетч и возвращает [],
+    чтобы текущий запрос не ждал Overpass (15-20 сек).
+    Следующий запрос через ~20 сек уже получит данные из кэша.
+    """
+    s, w, n, e = bbox
+    key = f"{s:.3f},{w:.3f},{n:.3f},{e:.3f}"
+    now = time.time()
+
+    cached = _danger_cache.get(key)
+    if cached:
+        zones, ts = cached
+        if now - ts < _DANGER_CACHE_TTL:
+            log.info(f"Danger zones cache HIT ({len(zones)} zones)")
+            return zones
+        # Устаревший кэш — используем старые данные и обновляем в фоне
+        log.info(f"Danger zones stale cache — using old data, refreshing in background")
+        asyncio.create_task(_do_fetch_danger_zones(key, bbox))
+        return zones
+
+    # Кэша нет — запускаем фоновый фетч, текущий запрос получит [] (без штрафов)
+    log.info("Danger zones: no cache — launching background fetch, safety skipped this request")
+    asyncio.create_task(_do_fetch_danger_zones(key, bbox))
+    return []
+
 
 # ─── Модели ───────────────────────────────────────────────────────────────────
 
@@ -532,6 +639,11 @@ async def shade_walk(req: dict):
 
     coords = [(lat, lon)]
 
+    # Зоны опасности: возвращает из кэша СРАЗУ или запускает фоновый фетч.
+    # Не блокирует запрос — первый запрос в новом городе строится без штрафов,
+    # со второго запроса данные уже в кэше (TTL 60 мин).
+    danger_zones = _get_danger_zones_nowait(bbox)
+
     async with httpx.AsyncClient() as client:
         buildings, street_segs = await asyncio.gather(
             _fetch_buildings_cached(coords, client),
@@ -557,6 +669,8 @@ async def shade_walk(req: dict):
             sun_alt,
             sun_az,
             sun_penalty,
+            2,            # max_routes
+            danger_zones, # опасные зоны для штрафа Dijkstra
         )
     )
 
@@ -573,15 +687,14 @@ async def shade_walk(req: dict):
         metrics = analyse_route(path, buildings, sun_alt, sun_az, weather,
                                 walk_speed=walk_speed, depart_dt=depart_dt, leaf_factor=leaf)
 
+        safety_score = loop_item.get("safety_score", 1.0)
         log.info(
             f"/shade-walk route: {int(total_dist)}m, shade={metrics['shade_fraction']:.1%}, "
-            f"bearing={loop_item['bearing']}, pts={len(path)}"
+            f"safety={safety_score:.1%}, bearing={loop_item['bearing']}, pts={len(path)}"
         )
 
         # Используем shade_fraction из Dijkstra-оптимизации (find_shade_loop),
         # если analyse_route вернул 0 (ночь или нет данных о зданиях).
-        # Dijkstra-оценка рассчитана на основе физических параметров здания и
-        # ориентации улиц, она точнее отражает ожидаемую тень маршрута.
         loop_sf   = loop_item.get("shade_fraction", 0.0)
         report_sf = metrics["shade_fraction"] if metrics["shade_fraction"] > 0.0 else loop_sf
 
@@ -591,6 +704,7 @@ async def shade_walk(req: dict):
             "duration_s":     metrics["duration_s"],
             "shade_fraction": round(report_sf, 3),
             "shade_map":      metrics.get("shade_map", ""),
+            "safety_score":   safety_score,
         })
 
     return {"routes": routes}
