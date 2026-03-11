@@ -957,7 +957,17 @@ def find_shade_loop(
         idx   = int(np.argmin((diffs ** 2).sum(axis=1)))
         return all_nodes[idx]
 
-    def _dijkstra(src: tuple, dst: tuple, budget_m: float, deadline: float):
+    def _dijkstra(src: tuple, dst: tuple, budget_m: float, deadline: float,
+                  avoid_edges: Optional[frozenset] = None,
+                  avoid_penalty: float = 6.0):
+        """
+        Dijkstra с опциональным штрафом за уже использованные рёбра.
+
+        avoid_edges: frozenset канонических ключей рёбер (min(n1,n2), max(n1,n2)).
+        avoid_penalty: множитель стоимости для рёбер из avoid_edges.
+          6× означает, что роутер предпочтёт обходной путь втрое длиннее,
+          чем вернуться той же улицей.
+        """
         INF = float("inf")
         g_cost:  dict = {src: 0.0}
         g_dist:  dict = {src: 0.0}
@@ -977,6 +987,11 @@ def find_shade_loop(
                 nd = g_dist[node] + ed
                 if nd > budget_m:
                     continue
+                # Штраф за повторное использование рёбер из первого плеча
+                if avoid_edges:
+                    ekey = (min(node, nb), max(node, nb))
+                    if ekey in avoid_edges:
+                        ec = ec * avoid_penalty
                 nc = c + ec
                 if nc < g_cost.get(nb, INF):
                     g_cost[nb]  = nc
@@ -993,6 +1008,16 @@ def find_shade_loop(
             n = came[n]
         path.reverse()
         return path, g_dist.get(dst, 0.0), g_shade.get(dst, 0.0)
+
+    def _path_edge_keys(path: list) -> frozenset:
+        """Извлекает канонические ключи рёбер из пути [(lat,lon), ...].
+        Используется для передачи в avoid_edges второго Dijkstra."""
+        keys = set()
+        for i in range(len(path) - 1):
+            n1 = _nid(path[i][0],   path[i][1])
+            n2 = _nid(path[i+1][0], path[i+1][1])
+            keys.add((min(n1, n2), max(n1, n2)))
+        return frozenset(keys)
 
     start    = _nearest(origin_lat, origin_lon)
     deadline = time.monotonic() + 25.0
@@ -1020,7 +1045,13 @@ def find_shade_loop(
         if r1 is None:
             continue
         path1, d1, shd1 = r1
-        r2 = _dijkstra(wp, start, half_budget, deadline)
+        # Передаём рёбра первого плеча — Dijkstra обратного пути будет
+        # штрафовать их ×6, предпочитая другие улицы.
+        used_edges = _path_edge_keys(path1)
+        r2 = _dijkstra(wp, start, half_budget, deadline, avoid_edges=used_edges)
+        if r2 is None:
+            # Запасной вариант: без штрафа (узкая улица или тупик)
+            r2 = _dijkstra(wp, start, half_budget, deadline)
         if r2 is None:
             continue
         path2, d2, shd2 = r2
